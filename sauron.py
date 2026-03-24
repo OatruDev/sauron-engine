@@ -98,7 +98,10 @@ def run_ingestion():
                     batch = []
                 else:
                     print(f"\n❌ Error en batch: {res.text}")
-                    time.sleep(5)
+                    # NUEVO: Vaciamos el lote para no acumular error sobre error
+                    batch = []
+                    # NUEVO: Pausa más larga (10s) para dejar respirar a la base de datos
+                    time.sleep(10) 
                     
         except Exception as e:
             log_failed(card_id, str(e))
@@ -111,6 +114,8 @@ def run_ingestion():
         if res.status_code in (200, 201):
             for c in batch: 
                 log_processed(c['id'])
+        else:
+            print(f"\n❌ Error en lote final: {res.text}")
 
 if __name__ == "__main__":
     run_ingestion()
