@@ -1,0 +1,8 @@
+# Ignorar secretos (CRÍTICO)
+.env
+
+# Ignorar datos locales pesados o temporales
+cache/
+failed_cards.log
+processed_ids.txt
+__pycache__/
