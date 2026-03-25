@@ -40,34 +40,36 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"Listo. {index.ntotal} cartas preparadas.")
 
-# --- BLOQUEO GLOBAL ---
+# --- ESTADO Y BLOQUEO GLOBAL ---
 ESTADO = {
     "pausado": False,
     "nombre": "",
     "set": "",
-    "imagen_temp": None
+    "imagen_temp": None,
+    "cooldown_hasta": 0.0  # Temporizador para evitar saltos
 }
 
 def scan_realtime(imagen):
     global ESTADO
     
-    # Si el sistema está esperando tu decisión, ignoramos las imágenes nuevas
-    if ESTADO["pausado"]:
-        return gr.skip()
+    # 1. Si está pausado o en tiempo de gracia (cooldown), ignoramos la cámara
+    if ESTADO["pausado"] or time.time() < ESTADO["cooldown_hasta"]:
+        return gr.update()
 
     if imagen is None: 
-        return gr.skip()
+        return gr.update()
 
     try:
+        # 2. Inferencia
         query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
         faiss.normalize_L2(query_vector)
         D, I = index.search(query_vector, 1)
         
-        # Umbral de detección
+        # 3. Umbral de detección
         if D[0][0] < 0.65:
-            return "<div class='mensaje-buscando'>🔴 Buscando carta...</div>"
+            return "<div class='mensaje-buscando'>🔴 Escaneando...</div>"
 
-        # Se detectó una carta. Bloqueamos el sistema.
+        # 4. Carta detectada: Bloqueamos el sistema
         ESTADO["pausado"] = True
         card = cards_data[I[0][0]]
         ESTADO["nombre"] = card['name']
@@ -83,13 +85,14 @@ def scan_realtime(imagen):
         return html_resultado
     
     except Exception as e:
-        print(f"Error en procesamiento: {e}")
-        return gr.skip()
+        # Esto evita el SyntaxError en la interfaz si hay un frame corrupto
+        print(f"Frame ignorado por error: {e}")
+        return gr.update()
 
 def confirmar_carta():
     global ESTADO
     if not ESTADO["nombre"] or ESTADO["imagen_temp"] is None: 
-        return gr.skip()
+        return gr.update()
     
     name = ESTADO["nombre"]
     set_code = ESTADO["set"]
@@ -102,22 +105,23 @@ def confirmar_carta():
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Liberar el bloqueo
+    # Liberar el bloqueo y aplicar 2 segundos de gracia para cambiar la carta
     ESTADO["pausado"] = False
-    return "<div class='mensaje-exito'>✅ Guardado. Siguiente carta...</div>"
+    ESTADO["cooldown_hasta"] = time.time() + 2.0
+    return "<div class='mensaje-exito'>✅ Guardado. Retira la carta...</div>"
 
 def rechazar_carta():
     global ESTADO
-    # Liberar el bloqueo sin guardar nada
+    # Liberar el bloqueo y aplicar 2 segundos de gracia para retirar la carta
     ESTADO["pausado"] = False
-    return "<div class='mensaje-error'>❌ Descartado. Siguiente carta...</div>"
+    ESTADO["cooldown_hasta"] = time.time() + 2.0
+    return "<div class='mensaje-error'>❌ Descartado. Retira la carta...</div>"
 
-# --- DISEÑO FIJO Y COMPACTO ---
+# --- DISEÑO FIJO ---
 css = """
 .gradio-container { padding: 5px !important; }
 .gradio-container video { transform: none !important; max-height: 40vh; object-fit: contain; }
 
-/* Contenedor de altura fija para evitar los saltos de interfaz */
 #caja-resultado {
     height: 90px !important;
     display: flex;
@@ -151,14 +155,13 @@ with gr.Blocks(title="SAURON UI", css=css) as demo:
     with gr.Row():
         output_html = gr.HTML(
             value="<div class='mensaje-buscando'>Iniciando sistema...</div>",
-            elem_id="caja-resultado" # Aplica la altura fija del CSS
+            elem_id="caja-resultado"
         )
         
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
         btn_si = gr.Button("✅ SÍ ES", variant="success")
 
-    # Bucle de procesamiento de video
     input_img.stream(
         fn=scan_realtime, 
         inputs=[input_img], 
@@ -166,7 +169,6 @@ with gr.Blocks(title="SAURON UI", css=css) as demo:
         queue=False
     )
     
-    # Controles de decisión
     btn_si.click(fn=confirmar_carta, outputs=[output_html])
     btn_no.click(fn=rechazar_carta, outputs=[output_html])
 
