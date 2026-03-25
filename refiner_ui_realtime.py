@@ -10,20 +10,16 @@ from PIL import Image
 import pandas as pd
 from datetime import datetime
 
-# --- CONFIGURACIÓN DE ARCHIVOS ---
+# --- CONFIGURACIÓN ---
 DB_PKL = 'sauron_database.pkl'
 CSV_LOG = 'bulk_fast_scan.csv'
 RLHF_DIR = 'dataset_rlhf'
-
 os.makedirs(RLHF_DIR, exist_ok=True)
 
 print("🧠 Cargando Cerebro Visual (CLIP)...")
 model = SentenceTransformer('sentence-transformers/clip-ViT-B-32')
 
 print(f"📦 Cargando Base de Datos Local ({DB_PKL})...")
-if not os.path.exists(DB_PKL):
-    raise FileNotFoundError(f"❌ No encuentro {DB_PKL}. Necesitas el respaldo local.")
-
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
@@ -32,8 +28,7 @@ processed_embeddings = []
 for c in cards_data:
     emb = c['embedding']
     if isinstance(emb, str):
-        try:
-            emb = json.loads(emb)
+        try: emb = json.loads(emb)
         except:
             emb = emb.strip("[]").split(",")
             emb = [float(x) for x in emb]
@@ -41,99 +36,110 @@ for c in cards_data:
 
 embeddings_matrix = np.array(processed_embeddings).astype('float32')
 faiss.normalize_L2(embeddings_matrix) 
-
-dimension = embeddings_matrix.shape[1]
-index = faiss.IndexFlatIP(dimension)
+index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
-print(f"✅ Listo. {index.ntotal} cartas cargadas en RAM.")
+print(f"✅ Listo. {index.ntotal} cartas.")
 
-# --- ESTADO GLOBAL ---
-estado_captura = {"imagen": None, "name": "", "set": ""}
+# --- EL MOTOR MANABOX (ESTADO GLOBAL) ---
+estado = {
+    "pausado": False, 
+    "imagen": None, 
+    "name": "", 
+    "set": "",
+    "html_actual": "<h3 style='text-align:center;'>Pon una carta frente a la cámara...</h3>"
+}
 
-def analizar_foto(imagen):
-    global estado_captura
-    # Si el usuario le da al botón pero no ha tomado foto
+def scan_realtime(imagen):
+    global estado
+    
+    # 1. Si está pausado esperando tu respuesta, congelamos la pantalla
+    if estado["pausado"]:
+        return estado["html_actual"], "⚠️ Esperando tu decisión..."
+
+    # 2. Si no hay imagen
     if imagen is None: 
-        return "<h3 style='color:orange; text-align:center;'>⚠️ Primero toma la foto, causa.</h3>", "Esperando..."
+        return "<h3 style='text-align:center;'>Encendiendo cámara...</h3>", "Cámara inactiva"
 
+    # 3. Escaneo en vivo
     t_start = time.time()
     query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
     faiss.normalize_L2(query_vector)
-
     D, I = index.search(query_vector, 1)
-    t_end = time.time()
-    latencia_ms = (t_end - t_start) * 1000
-
-    if D[0][0] < 0.65:
-        estado_captura = {"imagen": None, "name": "", "set": ""}
-        return "<h3 style='color:red; text-align:center;'>Confianza baja. Descarta y toma otra foto.</h3>", "❌ Baja confianza"
-
-    card = cards_data[I[0][0]]
-    estado_captura = {"imagen": imagen, "name": card['name'], "set": card['set_code']}
     
-    html_output = f"""
-    <div style='text-align:center; background-color: #1a1a1a; color: white; padding: 10px; border-radius: 10px;'>
-        <h2 style='margin:0;'>{card['name']}</h2>
+    # Si la confianza es muy baja, sigue buscando (sigue el stream)
+    if D[0][0] < 0.65:
+        return "<h3 style='text-align:center; color:orange;'>Buscando carta...</h3>", "Escaneando en vivo 🔴"
+
+    # 4. ¡Encontró algo! Congelamos el estado
+    card = cards_data[I[0][0]]
+    estado["pausado"] = True
+    estado["imagen"] = imagen
+    estado["name"] = card['name']
+    estado["set"] = card['set_code']
+    
+    latencia_ms = (time.time() - t_start) * 1000
+    
+    estado["html_actual"] = f"""
+    <div style='text-align:center; background-color: #003300; color: white; padding: 15px; border-radius: 10px; border: 2px solid #4caf50;'>
+        <h2 style='margin:0;'>¿Es {card['name']}?</h2>
         <p style='margin:0; color: #aaa;'>Set: {card['set_code'].upper()}</p>
-        <p style='margin:0; color: #4caf50;'>Confianza: {D[0][0]*100:.1f}% | Temp: {latencia_ms:.0f}ms</p>
+        <p style='margin:0; color: #4caf50;'>Confianza: {D[0][0]*100:.1f}% | {latencia_ms:.0f}ms</p>
     </div>
     """
-    return html_output, f"Detectado: {card['name']}"
+    return estado["html_actual"], f"¡Detectado! ¿Es esta?"
 
 def confirmar_carta():
-    global estado_captura
-    if not estado_captura["name"] or estado_captura["imagen"] is None: 
-        return "❌ Nada que guardar", gr.update(), gr.update()
+    global estado
+    if not estado["name"] or estado["imagen"] is None: 
+        return gr.update(), "No hay nada que guardar."
     
-    name = estado_captura["name"]
-    set_code = estado_captura["set"]
+    # Guardar datos RLHF y CSV
+    name = estado["name"]
+    set_code = estado["set"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Guardar foto RLHF
     nombre_archivo = f"{set_code}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
     ruta_imagen = os.path.join(RLHF_DIR, nombre_archivo)
-    estado_captura["imagen"].save(ruta_imagen)
+    estado["imagen"].save(ruta_imagen)
     
-    # Guardar en CSV
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Limpiamos el estado
-    estado_captura = {"imagen": None, "name": "", "set": ""}
-    
-    return f"✅ Guardado: {name}", None, "<h3 style='text-align:center;'>Foto guardada. Cámara reiniciada.</h3>"
+    # REINICIAR Y SEGUIR BUSCANDO
+    estado["pausado"] = False
+    estado["html_actual"] = "<h3 style='text-align:center; color:green;'>✅ Guardado. Siguiente carta...</h3>"
+    return estado["html_actual"], f"Guardado: {name}"
 
-def descartar_carta():
-    global estado_captura
-    estado_captura = {"imagen": None, "name": "", "set": ""}
-    return "🗑️ Descartada", None, "<h3 style='text-align:center;'>Descartado. Cámara reiniciada.</h3>"
+def rechazar_carta():
+    global estado
+    # REINICIAR Y SEGUIR BUSCANDO
+    estado["pausado"] = False
+    estado["html_actual"] = "<h3 style='text-align:center; color:red;'>❌ Descartado. Sigue escaneando...</h3>"
+    return estado["html_actual"], "Buscando de nuevo..."
 
 # --- INTERFAZ UI ---
-with gr.Blocks(title="SAURON RLHF") as demo:
-    gr.Markdown("# 👁️ SAURON - Entrenamiento RLHF")
+with gr.Blocks(title="SAURON ManaBox Mode") as demo:
+    gr.Markdown("# 👁️ SAURON - Escáner Continuo")
     
     with gr.Row():
-        input_img = gr.Image(sources=["webcam"], type="pil", label="1. Toma la foto (Usa el ícono para cámara trasera)")
+        # Volvemos a activar streaming=True para lectura en vivo
+        input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", label="1. Toca el ícono de la cámara para usar la Trasera")
     
-    with gr.Row():
-        btn_analizar = gr.Button("🔍 2. RECONOCER CARTA", variant="primary", size="lg")
-        
     with gr.Row():
         with gr.Column(scale=2):
-            output_html = gr.HTML(value="<h3 style='text-align:center;'>Esperando foto...</h3>", label="3. Pronóstico")
+            output_html = gr.HTML(value=estado["html_actual"], label="Resultado de la IA")
         with gr.Column(scale=1):
-            lbl_confirmacion = gr.Label(value="Esperando...", label="Estado")
+            lbl_estado = gr.Label(value="Iniciando...", label="Estado del Sistema")
             
             with gr.Row():
-                btn_descartar = gr.Button("🗑️ DESCARTAR", variant="secondary")
-                btn_confirmar = gr.Button("💾 CONFIRMAR", variant="success")
+                btn_no = gr.Button("❌ NO ES", variant="secondary", size="lg")
+                btn_si = gr.Button("✅ SÍ ES (Guardar)", variant="success", size="lg")
 
-    # El botón "RECONOCER CARTA" ahora dispara la acción
-    btn_analizar.click(fn=analizar_foto, inputs=[input_img], outputs=[output_html, lbl_confirmacion])
+    # El stream evalúa constantemente. Si se pausa, se salta la evaluación pesada.
+    input_img.stream(fn=scan_realtime, inputs=[input_img], outputs=[output_html, lbl_estado], queue=False)
     
-    # Botones de confirmación/descarte limpian la imagen para volver a empezar
-    btn_confirmar.click(fn=confirmar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
-    btn_descartar.click(fn=descartar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
+    btn_si.click(fn=confirmar_carta, inputs=[], outputs=[output_html, lbl_estado])
+    btn_no.click(fn=rechazar_carta, inputs=[], outputs=[output_html, lbl_estado])
 
 if __name__ == "__main__":
     demo.launch(share=True)
