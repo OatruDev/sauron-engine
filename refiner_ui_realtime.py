@@ -84,18 +84,17 @@ def confirmar_carta():
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     return f"✅ Guardado: {name} ({set_code})"
 
-# --- INTERFAZ UI ---
+# --- INTERFAZ UI LIMPIA ---
 with gr.Blocks(title="SAURON ManaBox Level") as demo:
     gr.Markdown("# 👁️ SAURON - Escáner Bulk Tiempo Real")
     
     with gr.Row():
-        # Configuramos la cámara: sin espejo y pidiendo webcam
+        # Limpiamos los parámetros para máxima compatibilidad con Gradio v5+
         input_img = gr.Image(
             sources=["webcam"], 
             streaming=True, 
             type="pil", 
-            label="Cámara en Vivo",
-            mirror_webcam=False
+            label="Cámara en Vivo"
         )
     
     with gr.Row():
@@ -105,12 +104,11 @@ with gr.Blocks(title="SAURON ManaBox Level") as demo:
             lbl_confirmacion = gr.Label(value="Esperando...", label="Última Guardada")
             btn_confirmar = gr.Button("💾 GUARDAR CARTA", variant="success")
 
-    # REINSTALADO: Esta línea es la que hace que la cámara envíe fotos al cerebro de SAURON
+    # Conectamos el flujo de video al modelo
     input_img.stream(fn=scan_realtime, inputs=[input_img], outputs=[output_html, lbl_confirmacion], queue=False)
-    
     btn_confirmar.click(fn=confirmar_carta, inputs=[], outputs=[lbl_confirmacion])
 
 if __name__ == "__main__":
     custom_css = ".gradio-container {background-color: #111; color: white;}"
-    # Se lanza en red local para tu celular
+    # Lanzamiento
     demo.launch(server_name="0.0.0.0", server_port=7860, css=custom_css)
