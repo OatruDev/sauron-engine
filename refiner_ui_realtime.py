@@ -22,12 +22,12 @@ model = SentenceTransformer('sentence-transformers/clip-ViT-B-32')
 
 print(f"📦 Cargando Base de Datos Local ({DB_PKL})...")
 if not os.path.exists(DB_PKL):
-    raise FileNotFoundError(f"❌ No encuentro {DB_PKL}.")
+    raise FileNotFoundError(f"❌ No encuentro {DB_PKL}. Necesitas el respaldo local.")
 
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
-print("⚡ Construyendo Índice FAISS en RAM...")
+print("⚡ Construyendo Índice FAISS en RAM (Velocidad de Luz)...")
 processed_embeddings = []
 for c in cards_data:
     emb = c['embedding']
@@ -52,7 +52,7 @@ estado_captura = {"imagen": None, "name": "", "set": ""}
 
 def analizar_foto(imagen):
     global estado_captura
-    # Si la imagen es None (porque la acabamos de limpiar), no hacemos nada
+    # Si la imagen es None, es que la acabamos de reiniciar
     if imagen is None: 
         return "Esperando captura...", "Cámara lista"
 
@@ -64,13 +64,14 @@ def analizar_foto(imagen):
     t_end = time.time()
     latencia_ms = (t_end - t_start) * 1000
 
-    if D[0][0] < 0.65:
+    if D[0][0] < 0.65: # Umbral de confianza
         estado_captura = {"imagen": None, "name": "", "set": ""}
-        return "<h3 style='color:red; text-align:center;'>No estoy seguro. Descarta y toma otra foto.</h3>", "❌ Baja confianza"
+        return "<h3 style='color:red; text-align:center;'>Confianza baja. Descarta y toma otra foto.</h3>", "❌ Baja confianza"
 
     card = cards_data[I[0][0]]
     estado_captura = {"imagen": imagen, "name": card['name'], "set": card['set_code']}
     
+    # ESTE ES EL PASO DE CONFIRMACIÓN Y PRONÓSTICO
     html_output = f"""
     <div style='text-align:center; background-color: #1a1a1a; color: white; padding: 10px; border-radius: 10px;'>
         <h2 style='margin:0;'>{card['name']}</h2>
@@ -83,23 +84,22 @@ def analizar_foto(imagen):
 def confirmar_carta():
     global estado_captura
     if not estado_captura["name"] or estado_captura["imagen"] is None: 
-        # Retornamos gr.update() para no afectar la interfaz si no hay nada
         return "❌ Nada que guardar", gr.update(), gr.update()
     
     name = estado_captura["name"]
     set_code = estado_captura["set"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 1. Guardar foto RLHF
+    # 1. Guardar la foto real para el RLHF
     nombre_archivo = f"{set_code}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
     ruta_imagen = os.path.join(RLHF_DIR, nombre_archivo)
     estado_captura["imagen"].save(ruta_imagen)
     
-    # 2. Guardar en CSV
+    # 2. Guardar en el CSV
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Limpiamos el estado
+    # Limpiamos el estado global
     estado_captura = {"imagen": None, "name": "", "set": ""}
     
     # Retornamos el mensaje, LIMPIAMOS la imagen (None la reinicia) y limpiamos el HTML
@@ -111,28 +111,29 @@ def descartar_carta():
     # Reiniciamos la cámara devolviendo None a la imagen
     return "🗑️ Descartada", None, "<h3 style='text-align:center;'>Descartado. Cámara reiniciada.</h3>"
 
-# --- INTERFAZ UI ---
-with gr.Blocks(title="SAURON RLHF") as demo:
+# --- INTERFAZ UI FINAL PARA RLHF ---
+with gr.Blocks(title="SAURON Entrenamiento RLHF") as demo:
     gr.Markdown("# 👁️ SAURON - Entrenamiento RLHF")
     
     with gr.Row():
-        # Quitamos streaming=True. Ahora Gradio esperará a que el usuario "tome la foto"
+        # CRÍTICO: No usar streaming=True. Gradio esperará a que el usuario "tome la foto"
         input_img = gr.Image(sources=["webcam"], type="pil", label="1. Encuadra la carta y toma la foto")
     
     with gr.Row():
         with gr.Column(scale=2):
-            output_html = gr.HTML(value="<h3 style='text-align:center;'>Esperando foto...</h3>", label="2. Resultado")
+            output_html = gr.HTML(value="<h3 style='text-align:center;'>Esperando foto...</h3>", label="2. Pronóstico")
         with gr.Column(scale=1):
             lbl_confirmacion = gr.Label(value="Esperando...", label="Estado")
             
             with gr.Row():
+                # Botones gigantes para el pulgar en móvil
                 btn_descartar = gr.Button("🗑️ DESCARTAR (Mal)", variant="secondary")
                 btn_confirmar = gr.Button("💾 CONFIRMAR (Bien)", variant="success")
 
-    # Cuando el usuario toma la foto, se ejecuta el análisis
+    # Esta línea conecta el tomar la foto con el análisis
     input_img.change(fn=analizar_foto, inputs=[input_img], outputs=[output_html, lbl_confirmacion])
     
-    # Botones de acción. Ojo: devuelven None a input_img para volver a prender la cámara
+    # Los botones también limpian la imagen de input_img para volver a prender la cámara
     btn_confirmar.click(fn=confirmar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
     btn_descartar.click(fn=descartar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
 
