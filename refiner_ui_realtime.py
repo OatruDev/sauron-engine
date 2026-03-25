@@ -40,115 +40,111 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"Listo. {index.ntotal} cartas preparadas.")
 
-def scan_realtime(imagen, pausado, invertir):
-    # Si el sistema está pausado (esperando decisión del usuario), ignoramos los nuevos frames.
-    # gr.skip() es crucial: evita que la interfaz se actualice y salte.
-    if pausado:
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+# --- BLOQUEO GLOBAL (Evita el salto de frames) ---
+ESTADO = {
+    "pausado": False,
+    "nombre": "",
+    "set": "",
+    "imagen_temp": None
+}
+
+def scan_realtime(imagen, invertir):
+    global ESTADO
+    
+    # Si está pausado, ignoramos cualquier imagen nueva que llegue de la cámara
+    if ESTADO["pausado"]:
+        return gr.skip(), gr.skip()
 
     if imagen is None: 
-        return "<h3 style='text-align:center;'>Encendiendo cámara...</h3>", "Cámara inactiva", False, "", ""
+        return "<div style='text-align:center; font-size:14px;'>Cámara inactiva</div>", "Iniciando..."
 
-    # Corregir el efecto espejo de la cámara de los navegadores móviles
     if invertir:
         imagen = ImageOps.mirror(imagen)
 
-    t_start = time.time()
     query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
     faiss.normalize_L2(query_vector)
     D, I = index.search(query_vector, 1)
     
+    # Umbral de detección
     if D[0][0] < 0.65:
-        return "<h3 style='text-align:center; color:orange;'>Buscando carta...</h3>", "Escaneando en vivo 🔴", False, "", ""
+        return "<div style='text-align:center; font-size:14px; color:#ff9800;'>Buscando...</div>", "🔴"
 
-    # ¡Se detectó una carta!
+    # Se detectó una carta. Bloqueamos el sistema instantáneamente.
+    ESTADO["pausado"] = True
     card = cards_data[I[0][0]]
-    latencia_ms = (time.time() - t_start) * 1000
+    ESTADO["nombre"] = card['name']
+    ESTADO["set"] = card['set_code']
+    ESTADO["imagen_temp"] = imagen
     
-    html_actual = f"""
-    <div style='text-align:center; background-color: #003300; color: white; padding: 15px; border-radius: 10px; border: 2px solid #4caf50;'>
-        <h2 style='margin:0;'>¿Es {card['name']}?</h2>
-        <p style='margin:0; color: #aaa;'>Set: {card['set_code'].upper()}</p>
-        <p style='margin:0; color: #4caf50;'>Confianza: {D[0][0]*100:.1f}% | {latencia_ms:.0f}ms</p>
+    html_compacto = f"""
+    <div style='text-align:center; background-color:#1e1e1e; color:white; padding:8px; border-radius:5px; border:1px solid #4caf50;'>
+        <strong style='font-size:16px;'>{card['name']}</strong><br>
+        <span style='font-size:12px; color:#aaa;'>Set: {card['set_code'].upper()} | {(D[0][0]*100):.1f}%</span>
     </div>
     """
-    # Retornamos pausado = True para detener el escaneo
-    return html_actual, "¡Detectado! ¿Es esta?", True, card['name'], card['set_code']
+    return html_compacto, "¡Pausado!"
 
-def confirmar_carta(imagen, name, set_code, invertir):
-    if not name or imagen is None: 
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+def confirmar_carta():
+    global ESTADO
+    if not ESTADO["nombre"] or ESTADO["imagen_temp"] is None: 
+        return gr.skip(), gr.skip()
     
-    # Invertir la imagen antes de guardarla para que el dataset RLHF sea correcto
-    if invertir:
-        imagen = ImageOps.mirror(imagen)
-        
+    name = ESTADO["nombre"]
+    set_code = ESTADO["set"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     nombre_archivo = f"{set_code}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
     ruta_imagen = os.path.join(RLHF_DIR, nombre_archivo)
-    imagen.save(ruta_imagen)
+    ESTADO["imagen_temp"].save(ruta_imagen)
     
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Despausar y limpiar estados
-    html_actual = "<h3 style='text-align:center; color:green;'>✅ Guardado. Siguiente carta...</h3>"
-    return html_actual, f"Guardado: {name}", False, "", ""
+    # Liberar el bloqueo para seguir escaneando
+    ESTADO["pausado"] = False
+    return "<div style='text-align:center; color:#4caf50; font-size:14px;'>✅ Guardado. Siguiente...</div>", "Buscando..."
 
 def rechazar_carta():
-    # Despausar y limpiar estados
-    html_actual = "<h3 style='text-align:center; color:red;'>❌ Descartado. Sigue escaneando...</h3>"
-    return html_actual, "Buscando de nuevo...", False, "", ""
+    global ESTADO
+    # Liberar el bloqueo sin guardar nada
+    ESTADO["pausado"] = False
+    return "<div style='text-align:center; color:#f44336; font-size:14px;'>❌ Descartado. Siguiente...</div>", "Buscando..."
 
-# CSS para forzar visualmente que el video no se vea invertido en la pantalla del celular
+# CSS compacto para evitar scroll innecesario en móvil
 css = """
-.gradio-container video { transform: none !important; }
+.gradio-container { padding: 5px !important; }
+.gradio-container video { transform: none !important; max-height: 40vh; object-fit: cover; }
+button { min-height: 40px !important; font-size: 14px !important; padding: 5px !important; }
 """
 
-with gr.Blocks(title="SAURON ManaBox Mode", css=css) as demo:
-    gr.Markdown("# 👁️ SAURON - Escáner Continuo")
-    
-    # Estados ocultos para evitar problemas de concurrencia
-    state_pausado = gr.State(False)
-    state_name = gr.State("")
-    state_set = gr.State("")
+with gr.Blocks(title="SAURON UI", css=css) as demo:
     
     with gr.Row():
-        input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", label="Cámara en vivo")
+        input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
+    
+    chk_invertir = gr.Checkbox(label="Espejo", value=True, visible=False) # Se mantiene funcional pero oculto para ahorrar espacio
     
     with gr.Row():
-        chk_invertir = gr.Checkbox(label="Corregir efecto espejo (Mantenlo activado)", value=True)
+        output_html = gr.HTML(value="<div style='text-align:center; font-size:14px;'>Enfoca una carta...</div>")
+    
+    with gr.Row():
+        lbl_estado = gr.Label(value="Iniciando...", show_label=False)
         
     with gr.Row():
-        with gr.Column(scale=2):
-            output_html = gr.HTML(value="<h3 style='text-align:center;'>Pon una carta frente a la cámara...</h3>", label="Resultado de la IA")
-        with gr.Column(scale=1):
-            lbl_estado = gr.Label(value="Iniciando...", label="Estado del Sistema")
-            
-            with gr.Row():
-                btn_no = gr.Button("❌ NO ES", variant="secondary", size="lg")
-                btn_si = gr.Button("✅ SÍ ES", variant="success", size="lg")
+        btn_no = gr.Button("❌ NO ES", variant="secondary")
+        btn_si = gr.Button("✅ SÍ ES", variant="success")
 
-    # Bucle de procesamiento de video
+    # Bucle de procesamiento
     input_img.stream(
         fn=scan_realtime, 
-        inputs=[input_img, state_pausado, chk_invertir], 
-        outputs=[output_html, lbl_estado, state_pausado, state_name, state_set], 
+        inputs=[input_img, chk_invertir], 
+        outputs=[output_html, lbl_estado], 
         queue=False
     )
     
-    # Controles de decisión
-    btn_si.click(
-        fn=confirmar_carta, 
-        inputs=[input_img, state_name, state_set, chk_invertir], 
-        outputs=[output_html, lbl_estado, state_pausado, state_name, state_set]
-    )
-    
-    btn_no.click(
-        fn=rechazar_carta, 
-        inputs=[], 
-        outputs=[output_html, lbl_estado, state_pausado, state_name, state_set]
-    )
+    # Controles
+    btn_si.click(fn=confirmar_carta, outputs=[output_html, lbl_estado])
+    btn_no.click(fn=rechazar_carta, outputs=[output_html, lbl_estado])
 
 if __name__ == "__main__":
     demo.launch(share=True)
