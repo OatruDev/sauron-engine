@@ -13,9 +13,8 @@ from datetime import datetime
 # --- CONFIGURACIÓN DE ARCHIVOS ---
 DB_PKL = 'sauron_database.pkl'
 CSV_LOG = 'bulk_fast_scan.csv'
-RLHF_DIR = 'dataset_rlhf' # Nueva carpeta para guardar las fotos reales
+RLHF_DIR = 'dataset_rlhf'
 
-# Crear directorio para las imágenes de entrenamiento si no existe
 os.makedirs(RLHF_DIR, exist_ok=True)
 
 print("🧠 Cargando Cerebro Visual (CLIP)...")
@@ -48,12 +47,14 @@ index = faiss.IndexFlatIP(dimension)
 index.add(embeddings_matrix)
 print(f"✅ Listo. {index.ntotal} cartas cargadas en RAM.")
 
-# Variable global para retener la imagen actual y sus datos
+# --- ESTADO GLOBAL ---
 estado_captura = {"imagen": None, "name": "", "set": ""}
 
-def scan_realtime(imagen):
+def analizar_foto(imagen):
     global estado_captura
-    if imagen is None: return "Esperando video...", ""
+    # Si la imagen es None (porque la acabamos de limpiar), no hacemos nada
+    if imagen is None: 
+        return "Esperando captura...", "Cámara lista"
 
     t_start = time.time()
     query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
@@ -63,11 +64,11 @@ def scan_realtime(imagen):
     t_end = time.time()
     latencia_ms = (t_end - t_start) * 1000
 
-    if D[0][0] < 0.65: # Umbral ligeramente más bajo para fotos reales
-        return "Buscando... (Pon la carta frente a la cámara)", ""
+    if D[0][0] < 0.65:
+        estado_captura = {"imagen": None, "name": "", "set": ""}
+        return "<h3 style='color:red; text-align:center;'>No estoy seguro. Descarta y toma otra foto.</h3>", "❌ Baja confianza"
 
     card = cards_data[I[0][0]]
-    # Guardamos la imagen en memoria temporalmente por si el usuario la confirma
     estado_captura = {"imagen": imagen, "name": card['name'], "set": card['set_code']}
     
     html_output = f"""
@@ -77,47 +78,63 @@ def scan_realtime(imagen):
         <p style='margin:0; color: #4caf50;'>Confianza: {D[0][0]*100:.1f}% | Temp: {latencia_ms:.0f}ms</p>
     </div>
     """
-    return html_output, f"{card['name']} [{card['set_code'].upper()}]"
+    return html_output, f"Detectado: {card['name']}"
 
 def confirmar_carta():
     global estado_captura
     if not estado_captura["name"] or estado_captura["imagen"] is None: 
-        return "❌ Nada que guardar"
+        # Retornamos gr.update() para no afectar la interfaz si no hay nada
+        return "❌ Nada que guardar", gr.update(), gr.update()
     
     name = estado_captura["name"]
     set_code = estado_captura["set"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 1. GUARDAR LA IMAGEN REAL PARA EL RLHF
+    # 1. Guardar foto RLHF
     nombre_archivo = f"{set_code}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
     ruta_imagen = os.path.join(RLHF_DIR, nombre_archivo)
     estado_captura["imagen"].save(ruta_imagen)
     
-    # 2. GUARDAR EN EL CSV
+    # 2. Guardar en CSV
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    return f"✅ Guardado: {name} (Foto capturada para RLHF)"
+    # Limpiamos el estado
+    estado_captura = {"imagen": None, "name": "", "set": ""}
+    
+    # Retornamos el mensaje, LIMPIAMOS la imagen (None la reinicia) y limpiamos el HTML
+    return f"✅ Guardado: {name}", None, "<h3 style='text-align:center;'>Foto guardada. Cámara reiniciada.</h3>"
+
+def descartar_carta():
+    global estado_captura
+    estado_captura = {"imagen": None, "name": "", "set": ""}
+    # Reiniciamos la cámara devolviendo None a la imagen
+    return "🗑️ Descartada", None, "<h3 style='text-align:center;'>Descartado. Cámara reiniciada.</h3>"
 
 # --- INTERFAZ UI ---
-with gr.Blocks(title="SAURON Bulk Scanner") as demo:
-    gr.Markdown("# 👁️ SAURON - Escáner Bulk (Fase Recolección RLHF)")
+with gr.Blocks(title="SAURON RLHF") as demo:
+    gr.Markdown("# 👁️ SAURON - Entrenamiento RLHF")
     
     with gr.Row():
-        # source="webcam" fuerza la cámara. 
-        input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", label="Cámara del Celular")
+        # Quitamos streaming=True. Ahora Gradio esperará a que el usuario "tome la foto"
+        input_img = gr.Image(sources=["webcam"], type="pil", label="1. Encuadra la carta y toma la foto")
     
     with gr.Row():
         with gr.Column(scale=2):
-            output_html = gr.HTML(label="Resultado")
+            output_html = gr.HTML(value="<h3 style='text-align:center;'>Esperando foto...</h3>", label="2. Resultado")
         with gr.Column(scale=1):
-            lbl_confirmacion = gr.Label(value="Esperando...", label="Última Guardada")
-            btn_confirmar = gr.Button("💾 CONFIRMAR Y GUARDAR FOTO", variant="success")
+            lbl_confirmacion = gr.Label(value="Esperando...", label="Estado")
+            
+            with gr.Row():
+                btn_descartar = gr.Button("🗑️ DESCARTAR (Mal)", variant="secondary")
+                btn_confirmar = gr.Button("💾 CONFIRMAR (Bien)", variant="success")
 
-    input_img.stream(fn=scan_realtime, inputs=[input_img], outputs=[output_html, lbl_confirmacion], queue=False)
-    btn_confirmar.click(fn=confirmar_carta, inputs=[], outputs=[lbl_confirmacion])
+    # Cuando el usuario toma la foto, se ejecuta el análisis
+    input_img.change(fn=analizar_foto, inputs=[input_img], outputs=[output_html, lbl_confirmacion])
+    
+    # Botones de acción. Ojo: devuelven None a input_img para volver a prender la cámara
+    btn_confirmar.click(fn=confirmar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
+    btn_descartar.click(fn=descartar_carta, inputs=[], outputs=[lbl_confirmacion, input_img, output_html])
 
 if __name__ == "__main__":
-    # CRÍTICO: share=True genera un enlace HTTPS seguro.
-    # Esto evita que Chrome en Android bloquee el acceso a la cámara trasera.
     demo.launch(share=True)
