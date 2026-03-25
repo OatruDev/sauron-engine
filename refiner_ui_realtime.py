@@ -6,7 +6,7 @@ import numpy as np
 import faiss
 import gradio as gr
 from sentence_transformers import SentenceTransformer
-from PIL import Image, ImageOps
+from PIL import Image
 import pandas as pd
 from datetime import datetime
 
@@ -40,7 +40,7 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"Listo. {index.ntotal} cartas preparadas.")
 
-# --- BLOQUEO GLOBAL (Evita el salto de frames) ---
+# --- BLOQUEO GLOBAL ---
 ESTADO = {
     "pausado": False,
     "nombre": "",
@@ -48,46 +48,48 @@ ESTADO = {
     "imagen_temp": None
 }
 
-def scan_realtime(imagen, invertir):
+def scan_realtime(imagen):
     global ESTADO
     
-    # Si está pausado, ignoramos cualquier imagen nueva que llegue de la cámara
+    # Si el sistema está esperando tu decisión, ignoramos las imágenes nuevas
     if ESTADO["pausado"]:
-        return gr.skip(), gr.skip()
+        return gr.skip()
 
     if imagen is None: 
-        return "<div style='text-align:center; font-size:14px;'>Cámara inactiva</div>", "Iniciando..."
+        return gr.skip()
 
-    if invertir:
-        imagen = ImageOps.mirror(imagen)
+    try:
+        query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
+        faiss.normalize_L2(query_vector)
+        D, I = index.search(query_vector, 1)
+        
+        # Umbral de detección
+        if D[0][0] < 0.65:
+            return "<div class='mensaje-buscando'>🔴 Buscando carta...</div>"
 
-    query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
-    faiss.normalize_L2(query_vector)
-    D, I = index.search(query_vector, 1)
+        # Se detectó una carta. Bloqueamos el sistema.
+        ESTADO["pausado"] = True
+        card = cards_data[I[0][0]]
+        ESTADO["nombre"] = card['name']
+        ESTADO["set"] = card['set_code']
+        ESTADO["imagen_temp"] = imagen
+        
+        html_resultado = f"""
+        <div class='mensaje-detectado'>
+            <strong>{card['name']}</strong><br>
+            <span style='font-size:14px; color:#aaa;'>Set: {card['set_code'].upper()} | Confianza: {(D[0][0]*100):.1f}%</span>
+        </div>
+        """
+        return html_resultado
     
-    # Umbral de detección
-    if D[0][0] < 0.65:
-        return "<div style='text-align:center; font-size:14px; color:#ff9800;'>Buscando...</div>", "🔴"
-
-    # Se detectó una carta. Bloqueamos el sistema instantáneamente.
-    ESTADO["pausado"] = True
-    card = cards_data[I[0][0]]
-    ESTADO["nombre"] = card['name']
-    ESTADO["set"] = card['set_code']
-    ESTADO["imagen_temp"] = imagen
-    
-    html_compacto = f"""
-    <div style='text-align:center; background-color:#1e1e1e; color:white; padding:8px; border-radius:5px; border:1px solid #4caf50;'>
-        <strong style='font-size:16px;'>{card['name']}</strong><br>
-        <span style='font-size:12px; color:#aaa;'>Set: {card['set_code'].upper()} | {(D[0][0]*100):.1f}%</span>
-    </div>
-    """
-    return html_compacto, "¡Pausado!"
+    except Exception as e:
+        print(f"Error en procesamiento: {e}")
+        return gr.skip()
 
 def confirmar_carta():
     global ESTADO
     if not ESTADO["nombre"] or ESTADO["imagen_temp"] is None: 
-        return gr.skip(), gr.skip()
+        return gr.skip()
     
     name = ESTADO["nombre"]
     set_code = ESTADO["set"]
@@ -100,51 +102,73 @@ def confirmar_carta():
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Liberar el bloqueo para seguir escaneando
+    # Liberar el bloqueo
     ESTADO["pausado"] = False
-    return "<div style='text-align:center; color:#4caf50; font-size:14px;'>✅ Guardado. Siguiente...</div>", "Buscando..."
+    return "<div class='mensaje-exito'>✅ Guardado. Siguiente carta...</div>"
 
 def rechazar_carta():
     global ESTADO
     # Liberar el bloqueo sin guardar nada
     ESTADO["pausado"] = False
-    return "<div style='text-align:center; color:#f44336; font-size:14px;'>❌ Descartado. Siguiente...</div>", "Buscando..."
+    return "<div class='mensaje-error'>❌ Descartado. Siguiente carta...</div>"
 
-# CSS compacto para evitar scroll innecesario en móvil
+# --- DISEÑO FIJO Y COMPACTO ---
 css = """
 .gradio-container { padding: 5px !important; }
-.gradio-container video { transform: none !important; max-height: 40vh; object-fit: cover; }
-button { min-height: 40px !important; font-size: 14px !important; padding: 5px !important; }
+.gradio-container video { transform: none !important; max-height: 40vh; object-fit: contain; }
+
+/* Contenedor de altura fija para evitar los saltos de interfaz */
+#caja-resultado {
+    height: 90px !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 5px;
+    width: 100%;
+}
+
+.mensaje-buscando { color: #ff9800; font-size: 16px; font-weight: bold; }
+.mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; }
+.mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; }
+.mensaje-detectado {
+    background-color: #1e1e1e;
+    color: white;
+    padding: 10px;
+    border-radius: 8px;
+    border: 2px solid #4caf50;
+    width: 100%;
+    text-align: center;
+    font-size: 18px;
+}
+
+button { min-height: 50px !important; font-size: 16px !important; font-weight: bold !important; }
 """
 
 with gr.Blocks(title="SAURON UI", css=css) as demo:
-    
     with gr.Row():
         input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
     
-    chk_invertir = gr.Checkbox(label="Espejo", value=True, visible=False) # Se mantiene funcional pero oculto para ahorrar espacio
-    
     with gr.Row():
-        output_html = gr.HTML(value="<div style='text-align:center; font-size:14px;'>Enfoca una carta...</div>")
-    
-    with gr.Row():
-        lbl_estado = gr.Label(value="Iniciando...", show_label=False)
+        output_html = gr.HTML(
+            value="<div class='mensaje-buscando'>Iniciando sistema...</div>",
+            elem_id="caja-resultado" # Aplica la altura fija del CSS
+        )
         
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
         btn_si = gr.Button("✅ SÍ ES", variant="success")
 
-    # Bucle de procesamiento
+    # Bucle de procesamiento de video
     input_img.stream(
         fn=scan_realtime, 
-        inputs=[input_img, chk_invertir], 
-        outputs=[output_html, lbl_estado], 
+        inputs=[input_img], 
+        outputs=[output_html], 
         queue=False
     )
     
-    # Controles
-    btn_si.click(fn=confirmar_carta, outputs=[output_html, lbl_estado])
-    btn_no.click(fn=rechazar_carta, outputs=[output_html, lbl_estado])
+    # Controles de decisión
+    btn_si.click(fn=confirmar_carta, outputs=[output_html])
+    btn_no.click(fn=rechazar_carta, outputs=[output_html])
 
 if __name__ == "__main__":
     demo.launch(share=True)
