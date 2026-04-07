@@ -46,13 +46,13 @@ ESTADO = {
     "nombre": "",
     "set": "",
     "imagen_temp": None,
-    "cooldown_hasta": 0.0  # Temporizador para evitar saltos
+    "cooldown_hasta": 0.0,
+    "blacklist": set()  # Almacena las cartas rechazadas en la sesión actual
 }
 
 def scan_realtime(imagen):
     global ESTADO
     
-    # 1. Si está pausado o en tiempo de gracia (cooldown), ignoramos la cámara
     if ESTADO["pausado"] or time.time() < ESTADO["cooldown_hasta"]:
         return gr.update()
 
@@ -60,18 +60,27 @@ def scan_realtime(imagen):
         return gr.update()
 
     try:
-        # 2. Inferencia
+        # Optimización de rendimiento
+        imagen.thumbnail((512, 512), Image.Resampling.LANCZOS)
+
+        # Inferencia
         query_vector = model.encode(imagen).astype('float32').reshape(1, -1)
         faiss.normalize_L2(query_vector)
         D, I = index.search(query_vector, 1)
         
-        # 3. Umbral de detección
+        # Si no hay carta en pantalla (o hay mucho ruido), limpiamos la lista negra
         if D[0][0] < 0.65:
+            ESTADO["blacklist"].clear()
             return "<div class='mensaje-buscando'>🔴 Escaneando...</div>"
 
-        # 4. Carta detectada: Bloqueamos el sistema
-        ESTADO["pausado"] = True
         card = cards_data[I[0][0]]
+        
+        # Si la carta detectada está en la lista negra, la ignoramos visualmente
+        if card['name'] in ESTADO["blacklist"]:
+            return "<div class='mensaje-buscando' style='color:#f44336;'>Ignorando coincidencia rechazada...</div>"
+
+        # Carta nueva detectada: Bloqueamos el sistema
+        ESTADO["pausado"] = True
         ESTADO["nombre"] = card['name']
         ESTADO["set"] = card['set_code']
         ESTADO["imagen_temp"] = imagen
@@ -85,7 +94,6 @@ def scan_realtime(imagen):
         return html_resultado
     
     except Exception as e:
-        # Esto evita el SyntaxError en la interfaz si hay un frame corrupto
         print(f"Frame ignorado por error: {e}")
         return gr.update()
 
@@ -98,24 +106,34 @@ def confirmar_carta():
     set_code = ESTADO["set"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    nombre_archivo = f"{set_code}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
-    ruta_imagen = os.path.join(RLHF_DIR, nombre_archivo)
+    set_dir = os.path.join(RLHF_DIR, set_code)
+    os.makedirs(set_dir, exist_ok=True)
+    
+    nombre_archivo = f"{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg"
+    ruta_imagen = os.path.join(set_dir, nombre_archivo)
+    
     ESTADO["imagen_temp"].save(ruta_imagen)
     
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
-    # Liberar el bloqueo y aplicar 2 segundos de gracia para cambiar la carta
+    # Liberar el sistema
     ESTADO["pausado"] = False
-    ESTADO["cooldown_hasta"] = time.time() + 2.0
+    ESTADO["cooldown_hasta"] = time.time() + 1.5
+    # Limpiamos la lista negra al confirmar para la siguiente carta
+    ESTADO["blacklist"].clear() 
     return "<div class='mensaje-exito'>✅ Guardado. Retira la carta...</div>"
 
 def rechazar_carta():
     global ESTADO
-    # Liberar el bloqueo y aplicar 2 segundos de gracia para retirar la carta
+    # Añadimos la carta a la lista negra para no volver a sugerirla
+    if ESTADO["nombre"]:
+        ESTADO["blacklist"].add(ESTADO["nombre"])
+        
     ESTADO["pausado"] = False
-    ESTADO["cooldown_hasta"] = time.time() + 2.0
-    return "<div class='mensaje-error'>❌ Descartado. Retira la carta...</div>"
+    # Cooldown más corto porque ya no saltará con la misma carta
+    ESTADO["cooldown_hasta"] = time.time() + 0.5 
+    return "<div class='mensaje-error'>❌ Descartado. Sigue enfocando...</div>"
 
 # --- DISEÑO FIJO ---
 css = """
@@ -131,9 +149,9 @@ css = """
     width: 100%;
 }
 
-.mensaje-buscando { color: #ff9800; font-size: 16px; font-weight: bold; }
-.mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; }
-.mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; }
+.mensaje-buscando { color: #ff9800; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
+.mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
+.mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-detectado {
     background-color: #1e1e1e;
     color: white;
