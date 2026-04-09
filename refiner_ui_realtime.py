@@ -9,7 +9,7 @@ import gradio as gr
 from sentence_transformers import SentenceTransformer
 import easyocr
 from rapidfuzz import process, fuzz
-from PIL import Image
+from PIL import Image, ImageOps
 import pandas as pd
 from datetime import datetime
 import warnings
@@ -64,7 +64,7 @@ ESTADO = {
     "pausado": False,
     "nombre": "",
     "set": "",
-    "imagen_temp": None, # Aquí guardaremos la carta ya recortada y enderezada
+    "imagen_temp": None,
     "cooldown_hasta": 0.0,
     "blacklist": set()
 }
@@ -157,13 +157,16 @@ def scan_realtime(imagen):
     try:
         t_start = time.time()
         
+        # --- EL FIX CRÍTICO: Des-espejar la imagen cruda que manda Gradio ---
+        imagen = ImageOps.mirror(imagen)
+
         # 1. DETECCIÓN Y RECTIFICACIÓN
         card_img = detect_and_rectify_card(imagen)
         if card_img is None:
             ESTADO["blacklist"].clear()
             return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta completa...</div>"
 
-        # 2. FASE VISUAL (FAISS) sobre la carta pura
+        # 2. FASE VISUAL (FAISS)
         query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
         faiss.normalize_L2(query_vector)
         D, I = index.search(query_vector, 15)
@@ -174,7 +177,7 @@ def scan_realtime(imagen):
         candidatos = [cards_data[idx] for idx in I[0]]
         nombres_candidatos = [c['name'] for c in candidatos]
 
-        # 3. FASE OCR sobre el 15% de la carta pura
+        # 3. FASE OCR
         roi_enhanced = crop_title_roi_v2(card_img)
         resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
         texto_ocr = " ".join(resultados_ocr).strip()
@@ -196,7 +199,7 @@ def scan_realtime(imagen):
         ESTADO["pausado"] = True
         ESTADO["nombre"] = carta_ganadora['name']
         ESTADO["set"] = carta_ganadora['set_code']
-        ESTADO["imagen_temp"] = card_img # GUARDAMOS LA CARTA ENDEREZADA
+        ESTADO["imagen_temp"] = card_img 
         
         latencia_ms = (time.time() - t_start) * 1000
         
