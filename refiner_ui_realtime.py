@@ -46,22 +46,42 @@ print(f"📦 Cargando Índice FAISS ({DB_PKL})...")
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
-print(f"🌐 Cargando Piedra Rosetta Local ({TRANSLATOR_DB})...")
+print("🌐 Preparando Diccionario Global Multilingüe...")
+diccionario_global = {} 
 if os.path.exists(TRANSLATOR_DB):
     with open(TRANSLATOR_DB, 'r', encoding='utf-8') as f:
         rosetta_stone = json.load(f)
+        for eng_name, foreign_list in rosetta_stone.items():
+            diccionario_global[eng_name] = eng_name
+            for f_name in foreign_list:
+                diccionario_global[f_name] = eng_name
 else:
-    print("⚠️ No se encontró la Piedra Rosetta. Ejecuta build_translator.py para leer cartas en otros idiomas.")
+    print("⚠️ No se encontró la Piedra Rosetta.")
     rosetta_stone = {}
 
+# OPTIMIZACIÓN CLAUDE #1: Pre-calcular la lista de 150k llaves una sola vez
+OPCIONES_GLOBALES = list(diccionario_global.keys())
+
+print("⚡ Procesando Vectores y Agrupando Variantes...")
 processed_embeddings = []
+cartas_por_nombre = {}
+
 for c in cards_data:
     emb = c['embedding']
     if isinstance(emb, str):
         try: emb = json.loads(emb)
         except: emb = [float(x) for x in emb.strip("[]").split(",")]
-    processed_embeddings.append(emb)
+    
+    # OPTIMIZACIÓN CLAUDE #3: Guardar el embedding ya en float32 para no usar json.loads() en el bucle
+    c['parsed_emb'] = np.array(emb, dtype='float32') 
+    processed_embeddings.append(c['parsed_emb'])
 
+    # Agrupar variantes por nombre
+    if c['name'] not in cartas_por_nombre:
+        cartas_por_nombre[c['name']] = []
+    cartas_por_nombre[c['name']].append(c)
+
+# Crear matriz e index FAISS
 embeddings_matrix = np.array(processed_embeddings).astype('float32')
 faiss.normalize_L2(embeddings_matrix) 
 index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
@@ -175,15 +195,15 @@ def scan_realtime(imagen):
             ESTADO["blacklist_variantes"].clear()
             return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta completa...</div>"
 
+        # OPTIMIZACIÓN CLAUDE #4: Vector normalizado L2
         query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
-        faiss.normalize_L2(query_vector)
+        faiss.normalize_L2(query_vector) 
         
         D, I = index.search(query_vector, 30)
         
         if D[0][0] < 0.65:
             return "<div class='mensaje-buscando'>🔴 Escaneando arte...</div>"
 
-        # Filtrado de Blacklists
         candidatos = [cards_data[idx] for idx in I[0]]
         candidatos_filtrados = []
         for c in candidatos:
@@ -194,13 +214,10 @@ def scan_realtime(imagen):
         if not candidatos_filtrados:
              return "<div class='mensaje-buscando' style='color:#f44336;'>Agotadas las versiones...</div>"
 
-        # --- EXPANSIÓN ROSETTA STONE ---
         diccionario_busqueda = {}
         for c in candidatos_filtrados:
             eng_name = c['name']
-            # Añadir nombre en inglés
             diccionario_busqueda[eng_name] = eng_name 
-            # Añadir todos los nombres extranjeros conocidos para esta carta
             for traduccion in rosetta_stone.get(eng_name, []):
                 diccionario_busqueda[traduccion] = eng_name
 
@@ -208,29 +225,59 @@ def scan_realtime(imagen):
         resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
         texto_ocr = " ".join(resultados_ocr).strip()
 
+        carta_ganadora = None
+        metodo_log = "Visual Puro (OCR Falló)"
+        puntaje_fuzzy = 0
+
         if texto_ocr:
-            # Ahora cruzamos el OCR contra TODOS los idiomas de nuestro Top 30
+            # FASE 1: Cruce contra el Top 30 visual
             mejor_coincidencia = process.extractOne(
                 query=texto_ocr, 
                 choices=list(diccionario_busqueda.keys()), 
                 scorer=fuzz.WRatio
             )
-            nombre_identificado, puntaje_fuzzy, _ = mejor_coincidencia
             
-            # La Piedra Rosetta nos dice cuál es su verdadero nombre en inglés
-            nombre_ingles_real = diccionario_busqueda[nombre_identificado]
+            if mejor_coincidencia:
+                nombre_identificado, puntaje_fuzzy, _ = mejor_coincidencia
             
-            # Buscamos la carta con el nombre en inglés
-            carta_ganadora = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
+            if puntaje_fuzzy >= 65:
+                nombre_ingles_real = diccionario_busqueda[nombre_identificado]
+                carta_ganadora = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
+                metodo_log = f"Local OCR: '{texto_ocr}'"
             
-            # Log bonito para la UI
-            idioma_tag = f"({nombre_identificado})" if nombre_identificado != nombre_ingles_real else ""
-            metodo_log = f"OCR: '{texto_ocr}' {idioma_tag}"
-        else:
+            else:
+                # FASE 2: GLOBAL OVERRIDE (Visión fracasó por iluminación/ruido)
+                # OPTIMIZACIÓN CLAUDE #1 & #2: Uso de OPCIONES_GLOBALES y score_cutoff para early exit
+                mejor_global = process.extractOne(
+                    query=texto_ocr, 
+                    choices=OPCIONES_GLOBALES, 
+                    scorer=fuzz.WRatio,
+                    score_cutoff=75
+                )
+                
+                if mejor_global:
+                    nombre_global_id, puntaje_global, _ = mejor_global
+                    nombre_ingles_real = diccionario_global[nombre_global_id]
+                    
+                    if nombre_ingles_real not in ESTADO["blacklist_nombres"]:
+                        variantes = cartas_por_nombre.get(nombre_ingles_real, [])
+                        variantes_validas = [v for v in variantes if v['id'] not in ESTADO["blacklist_variantes"]]
+                        
+                        if variantes_validas:
+                            # OPTIMIZACIÓN CLAUDE #3 & #4: Ya están en RAM y normalizados
+                            vectores_variantes = [v['parsed_emb'] for v in variantes_validas]
+                            matriz_var = np.array(vectores_variantes).astype('float32')
+                            # Como matriz_var ya fue normalizada en la carga inicial, np.dot es perfecto
+                            similitudes = np.dot(matriz_var, query_vector.T).flatten()
+                            mejor_var_idx = np.argmax(similitudes)
+                            
+                            carta_ganadora = variantes_validas[mejor_var_idx]
+                            puntaje_fuzzy = puntaje_global
+                            metodo_log = f"🚀 OVERRIDE: '{texto_ocr}'"
+        
+        # OPTIMIZACIÓN CLAUDE #5: Fallback Graceful explícito
+        if carta_ganadora is None:
             carta_ganadora = candidatos_filtrados[0]
-            texto_ocr = "Falló"
-            puntaje_fuzzy = 0
-            metodo_log = "Visual Puro"
 
         latencia_ms = (time.time() - t_start) * 1000
         nc = carta_ganadora.get('collector_number', '???')
@@ -306,7 +353,7 @@ button { min-height: 50px !important; font-size: 13px !important; font-weight: b
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.3...</div>", elem_id="caja-resultado")
+    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.5...</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
