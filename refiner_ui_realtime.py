@@ -59,14 +59,15 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 
-# --- ESTADO GLOBAL ---
+# --- ESTADO GLOBAL MEJORADO ---
 ESTADO = {
     "pausado": False,
     "nombre": "",
     "set": "",
     "imagen_temp": None,
     "cooldown_hasta": 0.0,
-    "blacklist": set()
+    "blacklist_nombres": set(),   # Para cuando falla la carta entera
+    "blacklist_variantes": set()  # Para cuando acierta carta pero falla el set
 }
 
 # --- FUNCIONES DE VISIÓN (OpenCV) ---
@@ -122,8 +123,7 @@ def detect_and_rectify_card(frame):
             best_cnt = approx
             best_area = area
 
-    if best_cnt is None:
-        return None
+    if best_cnt is None: return None
 
     pts_work = best_cnt.reshape(4, 2).astype(np.float32)
     pts_orig = pts_work * (1.0 / scale)
@@ -156,46 +156,49 @@ def scan_realtime(imagen):
 
     try:
         t_start = time.time()
-        
-        # --- EL FIX CRÍTICO: Des-espejar la imagen cruda que manda Gradio ---
         imagen = ImageOps.mirror(imagen)
 
-        # 1. DETECCIÓN Y RECTIFICACIÓN
         card_img = detect_and_rectify_card(imagen)
         if card_img is None:
-            ESTADO["blacklist"].clear()
+            ESTADO["blacklist_nombres"].clear()
+            ESTADO["blacklist_variantes"].clear()
             return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta completa...</div>"
 
-        # 2. FASE VISUAL (FAISS)
         query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
         faiss.normalize_L2(query_vector)
-        D, I = index.search(query_vector, 15)
+        
+        # Aumentamos a 30 para asegurar que atrapamos todas las reimpresiones (Ej. Sol Ring)
+        D, I = index.search(query_vector, 30)
         
         if D[0][0] < 0.65:
             return "<div class='mensaje-buscando'>🔴 Escaneando arte...</div>"
 
+        # Filtrado de Blacklists ANTES del OCR
         candidatos = [cards_data[idx] for idx in I[0]]
-        nombres_candidatos = [c['name'] for c in candidatos]
+        candidatos_filtrados = []
+        for c in candidatos:
+            if c['name'] in ESTADO["blacklist_nombres"]: continue
+            if f"{c['name']}_{c['set_code']}" in ESTADO["blacklist_variantes"]: continue
+            candidatos_filtrados.append(c)
 
-        # 3. FASE OCR
+        if not candidatos_filtrados:
+             return "<div class='mensaje-buscando' style='color:#f44336;'>Agotadas las opciones de set...</div>"
+
+        nombres_candidatos = [c['name'] for c in candidatos_filtrados]
+
         roi_enhanced = crop_title_roi_v2(card_img)
         resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
         texto_ocr = " ".join(resultados_ocr).strip()
 
-        # 4. FASE VEREDICTO
         if texto_ocr:
             mejor_coincidencia = process.extractOne(query=texto_ocr, choices=nombres_candidatos, scorer=fuzz.WRatio)
             nombre_ganador, puntaje_fuzzy, indice_ganador = mejor_coincidencia
-            carta_ganadora = candidatos[indice_ganador]
+            carta_ganadora = candidatos_filtrados[indice_ganador]
             metodo_log = f"OCR: '{texto_ocr}' | Score: {puntaje_fuzzy:.0f}"
         else:
-            carta_ganadora = candidatos[0]
+            carta_ganadora = candidatos_filtrados[0]
             metodo_log = "Visual Puro (OCR Falló)"
-            
-        if carta_ganadora['name'] in ESTADO["blacklist"]:
-            return "<div class='mensaje-buscando' style='color:#f44336;'>Ignorando coincidencias previas...</div>"
 
-        # 5. PAUSA Y RESULTADO
         ESTADO["pausado"] = True
         ESTADO["nombre"] = carta_ganadora['name']
         ESTADO["set"] = carta_ganadora['set_code']
@@ -233,15 +236,24 @@ def confirmar_carta():
     
     ESTADO["pausado"] = False
     ESTADO["cooldown_hasta"] = time.time() + 1.5
-    ESTADO["blacklist"].clear() 
+    ESTADO["blacklist_nombres"].clear()
+    ESTADO["blacklist_variantes"].clear()
     return "<div class='mensaje-exito'>✅ Guardado. Retira la carta...</div>"
 
 def rechazar_carta():
     global ESTADO
-    if ESTADO["nombre"]: ESTADO["blacklist"].add(ESTADO["nombre"])
+    if ESTADO["nombre"]: ESTADO["blacklist_nombres"].add(ESTADO["nombre"])
     ESTADO["pausado"] = False
     ESTADO["cooldown_hasta"] = time.time() + 0.5 
-    return "<div class='mensaje-error'>❌ Descartado. Escaneando...</div>"
+    return "<div class='mensaje-error'>❌ Carta equivocada. Escaneando...</div>"
+
+def rechazar_set():
+    global ESTADO
+    if ESTADO["nombre"] and ESTADO["set"]: 
+        ESTADO["blacklist_variantes"].add(f"{ESTADO['nombre']}_{ESTADO['set']}")
+    ESTADO["pausado"] = False
+    ESTADO["cooldown_hasta"] = time.time() + 0.2 # Cooldown corto para que pruebe el siguiente set rápido
+    return "<div class='mensaje-buscando' style='color:#2196F3;'>🔄 Buscando otro Set...</div>"
 
 # --- INTERFAZ ---
 css = """
@@ -252,19 +264,22 @@ css = """
 .mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-detectado { background-color: #1e1e1e; color: white; padding: 10px; border-radius: 8px; border: 2px solid #4caf50; width: 100%; text-align: center; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-button { min-height: 50px !important; font-size: 16px !important; font-weight: bold !important; border-radius: 8px !important; }
+button { min-height: 50px !important; font-size: 14px !important; font-weight: bold !important; border-radius: 8px !important; }
 """
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
     with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2...</div>", elem_id="caja-resultado")
+    
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
+        btn_otro_set = gr.Button("🔄 OTRO SET", variant="primary")
         btn_si = gr.Button("✅ SÍ ES", variant="success")
 
     input_img.stream(fn=scan_realtime, inputs=[input_img], outputs=[output_html], queue=False)
     btn_si.click(fn=confirmar_carta, outputs=[output_html])
     btn_no.click(fn=rechazar_carta, outputs=[output_html])
+    btn_otro_set.click(fn=rechazar_set, outputs=[output_html])
 
 if __name__ == "__main__":
     demo.launch(share=True)
