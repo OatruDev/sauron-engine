@@ -6,6 +6,8 @@ import numpy as np
 import faiss
 import cv2
 import gradio as gr
+import requests
+import re
 from sentence_transformers import SentenceTransformer
 import easyocr
 from rapidfuzz import process, fuzz
@@ -45,7 +47,6 @@ print(f"📦 Cargando Índice FAISS ({DB_PKL})...")
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
-# Verificar que el parche se aplicó
 if len(cards_data) > 0 and 'collector_number' not in cards_data[0]:
     print("⚠️ ADVERTENCIA: No se detectó 'collector_number'. Ejecuta patch_db.py primero.")
 
@@ -66,14 +67,14 @@ print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 # --- ESTADO GLOBAL MEJORADO ---
 ESTADO = {
     "pausado": False,
-    "id": "",            # ID único de Scryfall (Esencial para variantes)
+    "id": "",            
     "nombre": "",
     "set": "",
-    "nc": "",            # Collector Number
+    "nc": "",            
     "imagen_temp": None,
     "cooldown_hasta": 0.0,
     "blacklist_nombres": set(),   
-    "blacklist_variantes": set()  # Ahora guarda IDs únicos
+    "blacklist_variantes": set()  
 }
 
 # --- FUNCIONES DE VISIÓN (OpenCV) ---
@@ -183,7 +184,7 @@ def scan_realtime(imagen):
         candidatos_filtrados = []
         for c in candidatos:
             if c['name'] in ESTADO["blacklist_nombres"]: continue
-            if c['id'] in ESTADO["blacklist_variantes"]: continue # Bloquea versión exacta
+            if c['id'] in ESTADO["blacklist_variantes"]: continue 
             candidatos_filtrados.append(c)
 
         if not candidatos_filtrados:
@@ -195,20 +196,44 @@ def scan_realtime(imagen):
         resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
         texto_ocr = " ".join(resultados_ocr).strip()
 
+        # FASE VEREDICTO CON FALLBACK DE IDIOMAS
         if texto_ocr:
             mejor_coincidencia = process.extractOne(query=texto_ocr, choices=nombres_candidatos, scorer=fuzz.WRatio)
             nombre_ganador, puntaje_fuzzy, indice_ganador = mejor_coincidencia
+            metodo_log = f"OCR: '{texto_ocr}'"
+            
+            # Si el puntaje es muy bajo, asumimos que es otro idioma o ruido
+            if puntaje_fuzzy < 65:
+                # Limpiamos letras sueltas y nos quedamos con las primeras palabras
+                texto_limpio = re.sub(r'[^a-zA-ZáéíóúÁÉÍÓÚñÑ\s]', ' ', texto_ocr).strip()
+                texto_limpio = " ".join(texto_limpio.split()[:4])
+                
+                if texto_limpio:
+                    try:
+                        res = requests.get("https://api.scryfall.com/cards/search", params={"q": texto_limpio}, timeout=2).json()
+                        if "data" in res:
+                            # Revisamos si el nombre oficial en inglés devuelto está en nuestro Top 30
+                            for card_res in res["data"][:3]:
+                                nombre_ingles = card_res["name"]
+                                if nombre_ingles in nombres_candidatos:
+                                    indice_ganador = nombres_candidatos.index(nombre_ingles)
+                                    puntaje_fuzzy = 100
+                                    metodo_log = f"Scryfall Trad: '{nombre_ingles}'"
+                                    break
+                    except Exception as e:
+                        pass # Si no hay internet, se queda con la mejor opción visual local
+
             carta_ganadora = candidatos_filtrados[indice_ganador]
         else:
             carta_ganadora = candidatos_filtrados[0]
             texto_ocr = "Falló"
             puntaje_fuzzy = 0
+            metodo_log = "Visual Puro"
 
         latencia_ms = (time.time() - t_start) * 1000
         nc = carta_ganadora.get('collector_number', '???')
         
-        # FORMATO SOLICITADO
-        metodo_log = f"OCR: '{texto_ocr}' | NC: '{nc}' | Score: {puntaje_fuzzy:.0f} | {latencia_ms:.0f}ms"
+        info_log = f"{metodo_log} | NC: '{nc}' | Score: {puntaje_fuzzy:.0f} | {latencia_ms:.0f}ms"
 
         ESTADO["pausado"] = True
         ESTADO["id"] = carta_ganadora['id']
@@ -221,7 +246,7 @@ def scan_realtime(imagen):
         <div class='mensaje-detectado'>
             <strong>{carta_ganadora['name']}</strong><br>
             <span style='font-size:14px; color:#aaa;'>Set: {carta_ganadora['set_code'].upper()} | Visual: {(D[0][0]*100):.1f}%</span><br>
-            <span style='font-size:12px; color:#4caf50;'>{metodo_log}</span>
+            <span style='font-size:12px; color:#4caf50;'>{info_log}</span>
         </div>
         """
         return html_resultado
@@ -242,7 +267,6 @@ def confirmar_carta():
     ruta_imagen = os.path.join(set_dir, f"{nc}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg")
     ESTADO["imagen_temp"].save(ruta_imagen)
     
-    # También guardamos el NC en tu log CSV
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, nc, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "NC", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
@@ -261,8 +285,7 @@ def rechazar_carta():
 
 def rechazar_version():
     global ESTADO
-    if ESTADO["id"]: 
-        ESTADO["blacklist_variantes"].add(ESTADO["id"]) # Bloquea el ID exacto
+    if ESTADO["id"]: ESTADO["blacklist_variantes"].add(ESTADO["id"]) 
     ESTADO["pausado"] = False
     ESTADO["cooldown_hasta"] = time.time() + 0.2
     return "<div class='mensaje-buscando' style='color:#2196F3;'>🔄 Buscando otra versión...</div>"
@@ -281,7 +304,7 @@ button { min-height: 50px !important; font-size: 13px !important; font-weight: b
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.1...</div>", elem_id="caja-resultado")
+    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.2...</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
