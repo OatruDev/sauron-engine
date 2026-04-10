@@ -6,8 +6,6 @@ import numpy as np
 import faiss
 import cv2
 import gradio as gr
-import requests
-import re
 from sentence_transformers import SentenceTransformer
 import easyocr
 from rapidfuzz import process, fuzz
@@ -22,6 +20,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 DB_PKL = 'sauron_database.pkl'
 CSV_LOG = 'bulk_fast_scan.csv'
 RLHF_DIR = 'dataset_rlhf'
+TRANSLATOR_DB = 'sauron_translator.json'
 os.makedirs(RLHF_DIR, exist_ok=True)
 
 # --- PARÁMETROS DEL DETECTOR OPENCV ---
@@ -47,8 +46,13 @@ print(f"📦 Cargando Índice FAISS ({DB_PKL})...")
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
-if len(cards_data) > 0 and 'collector_number' not in cards_data[0]:
-    print("⚠️ ADVERTENCIA: No se detectó 'collector_number'. Ejecuta patch_db.py primero.")
+print(f"🌐 Cargando Piedra Rosetta Local ({TRANSLATOR_DB})...")
+if os.path.exists(TRANSLATOR_DB):
+    with open(TRANSLATOR_DB, 'r', encoding='utf-8') as f:
+        rosetta_stone = json.load(f)
+else:
+    print("⚠️ No se encontró la Piedra Rosetta. Ejecuta build_translator.py para leer cartas en otros idiomas.")
+    rosetta_stone = {}
 
 processed_embeddings = []
 for c in cards_data:
@@ -64,7 +68,7 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 
-# --- ESTADO GLOBAL MEJORADO ---
+# --- ESTADO GLOBAL ---
 ESTADO = {
     "pausado": False,
     "id": "",            
@@ -190,40 +194,38 @@ def scan_realtime(imagen):
         if not candidatos_filtrados:
              return "<div class='mensaje-buscando' style='color:#f44336;'>Agotadas las versiones...</div>"
 
-        nombres_candidatos = [c['name'] for c in candidatos_filtrados]
+        # --- EXPANSIÓN ROSETTA STONE ---
+        diccionario_busqueda = {}
+        for c in candidatos_filtrados:
+            eng_name = c['name']
+            # Añadir nombre en inglés
+            diccionario_busqueda[eng_name] = eng_name 
+            # Añadir todos los nombres extranjeros conocidos para esta carta
+            for traduccion in rosetta_stone.get(eng_name, []):
+                diccionario_busqueda[traduccion] = eng_name
 
         roi_enhanced = crop_title_roi_v2(card_img)
         resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
         texto_ocr = " ".join(resultados_ocr).strip()
 
-        # FASE VEREDICTO CON FALLBACK DE IDIOMAS
         if texto_ocr:
-            mejor_coincidencia = process.extractOne(query=texto_ocr, choices=nombres_candidatos, scorer=fuzz.WRatio)
-            nombre_ganador, puntaje_fuzzy, indice_ganador = mejor_coincidencia
-            metodo_log = f"OCR: '{texto_ocr}'"
+            # Ahora cruzamos el OCR contra TODOS los idiomas de nuestro Top 30
+            mejor_coincidencia = process.extractOne(
+                query=texto_ocr, 
+                choices=list(diccionario_busqueda.keys()), 
+                scorer=fuzz.WRatio
+            )
+            nombre_identificado, puntaje_fuzzy, _ = mejor_coincidencia
             
-            # Si el puntaje es muy bajo, asumimos que es otro idioma o ruido
-            if puntaje_fuzzy < 65:
-                # Limpiamos letras sueltas y nos quedamos con las primeras palabras
-                texto_limpio = re.sub(r'[^a-zA-ZáéíóúÁÉÍÓÚñÑ\s]', ' ', texto_ocr).strip()
-                texto_limpio = " ".join(texto_limpio.split()[:4])
-                
-                if texto_limpio:
-                    try:
-                        res = requests.get("https://api.scryfall.com/cards/search", params={"q": texto_limpio}, timeout=2).json()
-                        if "data" in res:
-                            # Revisamos si el nombre oficial en inglés devuelto está en nuestro Top 30
-                            for card_res in res["data"][:3]:
-                                nombre_ingles = card_res["name"]
-                                if nombre_ingles in nombres_candidatos:
-                                    indice_ganador = nombres_candidatos.index(nombre_ingles)
-                                    puntaje_fuzzy = 100
-                                    metodo_log = f"Scryfall Trad: '{nombre_ingles}'"
-                                    break
-                    except Exception as e:
-                        pass # Si no hay internet, se queda con la mejor opción visual local
-
-            carta_ganadora = candidatos_filtrados[indice_ganador]
+            # La Piedra Rosetta nos dice cuál es su verdadero nombre en inglés
+            nombre_ingles_real = diccionario_busqueda[nombre_identificado]
+            
+            # Buscamos la carta con el nombre en inglés
+            carta_ganadora = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
+            
+            # Log bonito para la UI
+            idioma_tag = f"({nombre_identificado})" if nombre_identificado != nombre_ingles_real else ""
+            metodo_log = f"OCR: '{texto_ocr}' {idioma_tag}"
         else:
             carta_ganadora = candidatos_filtrados[0]
             texto_ocr = "Falló"
@@ -304,7 +306,7 @@ button { min-height: 50px !important; font-size: 13px !important; font-weight: b
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.2...</div>", elem_id="caja-resultado")
+    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.3...</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
