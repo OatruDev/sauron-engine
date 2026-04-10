@@ -45,6 +45,10 @@ print(f"📦 Cargando Índice FAISS ({DB_PKL})...")
 with open(DB_PKL, 'rb') as f:
     cards_data = pickle.load(f)
 
+# Verificar que el parche se aplicó
+if len(cards_data) > 0 and 'collector_number' not in cards_data[0]:
+    print("⚠️ ADVERTENCIA: No se detectó 'collector_number'. Ejecuta patch_db.py primero.")
+
 processed_embeddings = []
 for c in cards_data:
     emb = c['embedding']
@@ -62,12 +66,14 @@ print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 # --- ESTADO GLOBAL MEJORADO ---
 ESTADO = {
     "pausado": False,
+    "id": "",            # ID único de Scryfall (Esencial para variantes)
     "nombre": "",
     "set": "",
+    "nc": "",            # Collector Number
     "imagen_temp": None,
     "cooldown_hasta": 0.0,
-    "blacklist_nombres": set(),   # Para cuando falla la carta entera
-    "blacklist_variantes": set()  # Para cuando acierta carta pero falla el set
+    "blacklist_nombres": set(),   
+    "blacklist_variantes": set()  # Ahora guarda IDs únicos
 }
 
 # --- FUNCIONES DE VISIÓN (OpenCV) ---
@@ -167,22 +173,21 @@ def scan_realtime(imagen):
         query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
         faiss.normalize_L2(query_vector)
         
-        # Aumentamos a 30 para asegurar que atrapamos todas las reimpresiones (Ej. Sol Ring)
         D, I = index.search(query_vector, 30)
         
         if D[0][0] < 0.65:
             return "<div class='mensaje-buscando'>🔴 Escaneando arte...</div>"
 
-        # Filtrado de Blacklists ANTES del OCR
+        # Filtrado de Blacklists
         candidatos = [cards_data[idx] for idx in I[0]]
         candidatos_filtrados = []
         for c in candidatos:
             if c['name'] in ESTADO["blacklist_nombres"]: continue
-            if f"{c['name']}_{c['set_code']}" in ESTADO["blacklist_variantes"]: continue
+            if c['id'] in ESTADO["blacklist_variantes"]: continue # Bloquea versión exacta
             candidatos_filtrados.append(c)
 
         if not candidatos_filtrados:
-             return "<div class='mensaje-buscando' style='color:#f44336;'>Agotadas las opciones de set...</div>"
+             return "<div class='mensaje-buscando' style='color:#f44336;'>Agotadas las versiones...</div>"
 
         nombres_candidatos = [c['name'] for c in candidatos_filtrados]
 
@@ -194,23 +199,29 @@ def scan_realtime(imagen):
             mejor_coincidencia = process.extractOne(query=texto_ocr, choices=nombres_candidatos, scorer=fuzz.WRatio)
             nombre_ganador, puntaje_fuzzy, indice_ganador = mejor_coincidencia
             carta_ganadora = candidatos_filtrados[indice_ganador]
-            metodo_log = f"OCR: '{texto_ocr}' | Score: {puntaje_fuzzy:.0f}"
         else:
             carta_ganadora = candidatos_filtrados[0]
-            metodo_log = "Visual Puro (OCR Falló)"
+            texto_ocr = "Falló"
+            puntaje_fuzzy = 0
+
+        latencia_ms = (time.time() - t_start) * 1000
+        nc = carta_ganadora.get('collector_number', '???')
+        
+        # FORMATO SOLICITADO
+        metodo_log = f"OCR: '{texto_ocr}' | NC: '{nc}' | Score: {puntaje_fuzzy:.0f} | {latencia_ms:.0f}ms"
 
         ESTADO["pausado"] = True
+        ESTADO["id"] = carta_ganadora['id']
         ESTADO["nombre"] = carta_ganadora['name']
         ESTADO["set"] = carta_ganadora['set_code']
+        ESTADO["nc"] = nc
         ESTADO["imagen_temp"] = card_img 
-        
-        latencia_ms = (time.time() - t_start) * 1000
         
         html_resultado = f"""
         <div class='mensaje-detectado'>
             <strong>{carta_ganadora['name']}</strong><br>
             <span style='font-size:14px; color:#aaa;'>Set: {carta_ganadora['set_code'].upper()} | Visual: {(D[0][0]*100):.1f}%</span><br>
-            <span style='font-size:12px; color:#4caf50;'>{metodo_log} | {latencia_ms:.0f}ms</span>
+            <span style='font-size:12px; color:#4caf50;'>{metodo_log}</span>
         </div>
         """
         return html_resultado
@@ -223,15 +234,16 @@ def confirmar_carta():
     global ESTADO
     if not ESTADO["nombre"] or ESTADO["imagen_temp"] is None: return gr.update()
     
-    name, set_code = ESTADO["nombre"], ESTADO["set"]
+    name, set_code, nc = ESTADO["nombre"], ESTADO["set"], ESTADO["nc"]
     fecha_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     set_dir = os.path.join(RLHF_DIR, set_code)
     os.makedirs(set_dir, exist_ok=True)
     
-    ruta_imagen = os.path.join(set_dir, f"{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg")
+    ruta_imagen = os.path.join(set_dir, f"{nc}_{name.replace(' ', '_').replace('/', '-')}_{fecha_str}.jpg")
     ESTADO["imagen_temp"].save(ruta_imagen)
     
-    nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "Ruta_Imagen"])
+    # También guardamos el NC en tu log CSV
+    nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, nc, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "NC", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
     ESTADO["pausado"] = False
@@ -247,13 +259,13 @@ def rechazar_carta():
     ESTADO["cooldown_hasta"] = time.time() + 0.5 
     return "<div class='mensaje-error'>❌ Carta equivocada. Escaneando...</div>"
 
-def rechazar_set():
+def rechazar_version():
     global ESTADO
-    if ESTADO["nombre"] and ESTADO["set"]: 
-        ESTADO["blacklist_variantes"].add(f"{ESTADO['nombre']}_{ESTADO['set']}")
+    if ESTADO["id"]: 
+        ESTADO["blacklist_variantes"].add(ESTADO["id"]) # Bloquea el ID exacto
     ESTADO["pausado"] = False
-    ESTADO["cooldown_hasta"] = time.time() + 0.2 # Cooldown corto para que pruebe el siguiente set rápido
-    return "<div class='mensaje-buscando' style='color:#2196F3;'>🔄 Buscando otro Set...</div>"
+    ESTADO["cooldown_hasta"] = time.time() + 0.2
+    return "<div class='mensaje-buscando' style='color:#2196F3;'>🔄 Buscando otra versión...</div>"
 
 # --- INTERFAZ ---
 css = """
@@ -264,22 +276,22 @@ css = """
 .mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-detectado { background-color: #1e1e1e; color: white; padding: 10px; border-radius: 8px; border: 2px solid #4caf50; width: 100%; text-align: center; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-button { min-height: 50px !important; font-size: 14px !important; font-weight: bold !important; border-radius: 8px !important; }
+button { min-height: 50px !important; font-size: 13px !important; font-weight: bold !important; border-radius: 8px !important; }
 """
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2...</div>", elem_id="caja-resultado")
+    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.1...</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
-        btn_otro_set = gr.Button("🔄 OTRO SET", variant="primary")
+        btn_otra_version = gr.Button("🔄 OTRA VERSIÓN", variant="primary")
         btn_si = gr.Button("✅ SÍ ES", variant="success")
 
     input_img.stream(fn=scan_realtime, inputs=[input_img], outputs=[output_html], queue=False)
     btn_si.click(fn=confirmar_carta, outputs=[output_html])
     btn_no.click(fn=rechazar_carta, outputs=[output_html])
-    btn_otro_set.click(fn=rechazar_set, outputs=[output_html])
+    btn_otra_version.click(fn=rechazar_version, outputs=[output_html])
 
 if __name__ == "__main__":
     demo.launch(share=True)
