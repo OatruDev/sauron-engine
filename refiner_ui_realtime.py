@@ -13,6 +13,7 @@ from PIL import Image, ImageOps
 import pandas as pd
 from datetime import datetime
 import warnings
+import concurrent.futures
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -59,7 +60,6 @@ else:
     print("⚠️ No se encontró la Piedra Rosetta.")
     rosetta_stone = {}
 
-# OPTIMIZACIÓN CLAUDE #1: Pre-calcular la lista de 150k llaves una sola vez
 OPCIONES_GLOBALES = list(diccionario_global.keys())
 
 print("⚡ Procesando Vectores y Agrupando Variantes...")
@@ -72,16 +72,13 @@ for c in cards_data:
         try: emb = json.loads(emb)
         except: emb = [float(x) for x in emb.strip("[]").split(",")]
     
-    # OPTIMIZACIÓN CLAUDE #3: Guardar el embedding ya en float32 para no usar json.loads() en el bucle
     c['parsed_emb'] = np.array(emb, dtype='float32') 
     processed_embeddings.append(c['parsed_emb'])
 
-    # Agrupar variantes por nombre
     if c['name'] not in cartas_por_nombre:
         cartas_por_nombre[c['name']] = []
     cartas_por_nombre[c['name']].append(c)
 
-# Crear matriz e index FAISS
 embeddings_matrix = np.array(processed_embeddings).astype('float32')
 faiss.normalize_L2(embeddings_matrix) 
 index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
@@ -123,6 +120,11 @@ def detect_and_rectify_card(frame):
     working = cv2.resize(bgr, (w_work, h_work), interpolation=cv2.INTER_AREA)
 
     gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < 80: 
+        return None 
+
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
     
@@ -167,14 +169,23 @@ def detect_and_rectify_card(frame):
 
     return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
 
-def crop_title_roi_v2(card_img):
+# FUNCIONES PARA MULTITHREADING
+def tarea_clip(card_img):
+    query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
+    faiss.normalize_L2(query_vector) 
+    D, I = index.search(query_vector, 30)
+    return query_vector, D, I
+
+def tarea_ocr(card_img):
     img_cv = np.array(card_img)
     h, w = img_cv.shape[:2]
     roi_h = max(int(h * 0.15), 20)
     roi = img_cv[0:roi_h, 0:w]
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
+    roi_enhanced = clahe.apply(gray)
+    resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
+    return " ".join(resultados_ocr).strip()
 
 # --- PIPELINE PRINCIPAL ---
 def scan_realtime(imagen):
@@ -193,13 +204,14 @@ def scan_realtime(imagen):
         if card_img is None:
             ESTADO["blacklist_nombres"].clear()
             ESTADO["blacklist_variantes"].clear()
-            return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta completa...</div>"
+            return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta (Evita moverla)...</div>"
 
-        # OPTIMIZACIÓN CLAUDE #4: Vector normalizado L2
-        query_vector = model.encode(card_img).astype('float32').reshape(1, -1)
-        faiss.normalize_L2(query_vector) 
-        
-        D, I = index.search(query_vector, 30)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futuro_clip = executor.submit(tarea_clip, card_img)
+            futuro_ocr = executor.submit(tarea_ocr, card_img)
+            
+            query_vector, D, I = futuro_clip.result()
+            texto_ocr = futuro_ocr.result()
         
         if D[0][0] < 0.65:
             return "<div class='mensaje-buscando'>🔴 Escaneando arte...</div>"
@@ -221,16 +233,11 @@ def scan_realtime(imagen):
             for traduccion in rosetta_stone.get(eng_name, []):
                 diccionario_busqueda[traduccion] = eng_name
 
-        roi_enhanced = crop_title_roi_v2(card_img)
-        resultados_ocr = reader.readtext(roi_enhanced, detail=0, paragraph=True, allowlist=ALLOWLIST)
-        texto_ocr = " ".join(resultados_ocr).strip()
-
         carta_ganadora = None
         metodo_log = "Visual Puro (OCR Falló)"
         puntaje_fuzzy = 0
 
         if texto_ocr:
-            # FASE 1: Cruce contra el Top 30 visual
             mejor_coincidencia = process.extractOne(
                 query=texto_ocr, 
                 choices=list(diccionario_busqueda.keys()), 
@@ -243,11 +250,9 @@ def scan_realtime(imagen):
             if puntaje_fuzzy >= 65:
                 nombre_ingles_real = diccionario_busqueda[nombre_identificado]
                 carta_ganadora = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
-                metodo_log = f"Local OCR: '{texto_ocr}'"
+                metodo_log = f"OCR: '{texto_ocr}'"
             
             else:
-                # FASE 2: GLOBAL OVERRIDE (Visión fracasó por iluminación/ruido)
-                # OPTIMIZACIÓN CLAUDE #1 & #2: Uso de OPCIONES_GLOBALES y score_cutoff para early exit
                 mejor_global = process.extractOne(
                     query=texto_ocr, 
                     choices=OPCIONES_GLOBALES, 
@@ -264,10 +269,8 @@ def scan_realtime(imagen):
                         variantes_validas = [v for v in variantes if v['id'] not in ESTADO["blacklist_variantes"]]
                         
                         if variantes_validas:
-                            # OPTIMIZACIÓN CLAUDE #3 & #4: Ya están en RAM y normalizados
                             vectores_variantes = [v['parsed_emb'] for v in variantes_validas]
                             matriz_var = np.array(vectores_variantes).astype('float32')
-                            # Como matriz_var ya fue normalizada en la carga inicial, np.dot es perfecto
                             similitudes = np.dot(matriz_var, query_vector.T).flatten()
                             mejor_var_idx = np.argmax(similitudes)
                             
@@ -275,15 +278,13 @@ def scan_realtime(imagen):
                             puntaje_fuzzy = puntaje_global
                             metodo_log = f"🚀 OVERRIDE: '{texto_ocr}'"
         
-        # OPTIMIZACIÓN CLAUDE #5: Fallback Graceful explícito
         if carta_ganadora is None:
             carta_ganadora = candidatos_filtrados[0]
 
         latencia_ms = (time.time() - t_start) * 1000
         nc = carta_ganadora.get('collector_number', '???')
+        set_code = carta_ganadora['set_code'].lower()
         
-        info_log = f"{metodo_log} | NC: '{nc}' | Score: {puntaje_fuzzy:.0f} | {latencia_ms:.0f}ms"
-
         ESTADO["pausado"] = True
         ESTADO["id"] = carta_ganadora['id']
         ESTADO["nombre"] = carta_ganadora['name']
@@ -291,11 +292,25 @@ def scan_realtime(imagen):
         ESTADO["nc"] = nc
         ESTADO["imagen_temp"] = card_img 
         
+        # --- NUEVA UI CON SVG DEL SET Y DISEÑO LIMPIO ---
         html_resultado = f"""
         <div class='mensaje-detectado'>
-            <strong>{carta_ganadora['name']}</strong><br>
-            <span style='font-size:14px; color:#aaa;'>Set: {carta_ganadora['set_code'].upper()} | Visual: {(D[0][0]*100):.1f}%</span><br>
-            <span style='font-size:12px; color:#4caf50;'>{info_log}</span>
+            <div style='font-size: 18px; font-weight: 800; margin-bottom: 6px; letter-spacing: 0.5px;'>
+                {carta_ganadora['name']}
+            </div>
+            
+            <div style='display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 15px; color: #ddd; margin-bottom: 8px; background: rgba(255,255,255,0.05); padding: 5px; border-radius: 6px;'>
+                <img src='https://svgs.scryfall.io/sets/{set_code}.svg' style='width: 22px; height: 22px; filter: invert(0.9);' alt='{set_code}'>
+                <strong style='color: #fff;'>{set_code.upper()}</strong>
+                <span style='color: #666;'>|</span>
+                <strong style='color: #4fc3f7;'>#{nc}</strong>
+                <span style='color: #666;'>|</span>
+                <span>👁️ {(D[0][0]*100):.1f}%</span>
+            </div>
+            
+            <div style='font-size: 11px; color: #4caf50; font-family: monospace;'>
+                {metodo_log} (Score: {puntaje_fuzzy:.0f}) ⚡ {latencia_ms:.0f}ms
+            </div>
         </div>
         """
         return html_resultado
@@ -343,17 +358,17 @@ def rechazar_version():
 css = """
 .gradio-container { padding: 5px !important; }
 .gradio-container video { transform: none !important; max-height: 40vh; object-fit: contain; }
-#caja-resultado { height: 110px !important; display: flex; align-items: center; justify-content: center; margin-bottom: 5px; width: 100%; }
+#caja-resultado { height: 120px !important; display: flex; align-items: center; justify-content: center; margin-bottom: 5px; width: 100%; }
 .mensaje-buscando { color: #ff9800; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
-.mensaje-detectado { background-color: #1e1e1e; color: white; padding: 10px; border-radius: 8px; border: 2px solid #4caf50; width: 100%; text-align: center; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-button { min-height: 50px !important; font-size: 13px !important; font-weight: bold !important; border-radius: 8px !important; }
+.mensaje-detectado { background-color: #121212; color: white; padding: 12px; border-radius: 10px; border: 2px solid #4caf50; width: 100%; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+button { min-height: 55px !important; font-size: 14px !important; font-weight: bold !important; border-radius: 8px !important; letter-spacing: 0.5px; }
 """
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.5...</div>", elem_id="caja-resultado")
+    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.6+UI...</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")
