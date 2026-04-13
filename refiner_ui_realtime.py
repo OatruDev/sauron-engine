@@ -85,6 +85,17 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 
+# --- INICIALIZAR CONTADOR DESDE EL CSV ---
+if os.path.exists(CSV_LOG):
+    try:
+        df_log = pd.read_csv(CSV_LOG)
+        conteo_inicial = len(df_log)
+        print(f"📊 Contador restaurado: ¡Llevas {conteo_inicial} cartas escaneadas!")
+    except:
+        conteo_inicial = 0
+else:
+    conteo_inicial = 0
+
 # --- ESTADO GLOBAL ---
 ESTADO = {
     "pausado": False,
@@ -95,7 +106,8 @@ ESTADO = {
     "imagen_temp": None,
     "cooldown_hasta": 0.0,
     "blacklist_nombres": set(),   
-    "blacklist_variantes": set()  
+    "blacklist_variantes": set(),
+    "total_guardadas": conteo_inicial  # <-- CONTADOR ACTIVO
 }
 
 # --- FUNCIONES DE VISIÓN (OpenCV) ---
@@ -292,9 +304,13 @@ def scan_realtime(imagen):
         ESTADO["nc"] = nc
         ESTADO["imagen_temp"] = card_img 
         
-        # --- NUEVA UI CON SVG DEL SET Y DISEÑO LIMPIO ---
+        # --- UI REDISEÑADA CON CONTADOR INYECTADO ---
         html_resultado = f"""
-        <div class='mensaje-detectado'>
+        <div class='mensaje-detectado' style='position: relative;'>
+            <div style='position: absolute; top: 6px; right: 10px; font-size: 11px; color: #aaa; font-weight: 800; letter-spacing: 0.5px;'>
+                📝 {ESTADO['total_guardadas']}
+            </div>
+            
             <div style='font-size: 18px; font-weight: 800; margin-bottom: 6px; letter-spacing: 0.5px;'>
                 {carta_ganadora['name']}
             </div>
@@ -334,11 +350,14 @@ def confirmar_carta():
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, nc, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "NC", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
+    ESTADO["total_guardadas"] += 1
+    total = ESTADO["total_guardadas"]
+    
     ESTADO["pausado"] = False
     ESTADO["cooldown_hasta"] = time.time() + 1.5
     ESTADO["blacklist_nombres"].clear()
     ESTADO["blacklist_variantes"].clear()
-    return "<div class='mensaje-exito'>✅ Guardado. Retira la carta...</div>"
+    return f"<div class='mensaje-exito'>✅ Guardado (Total: {total} cartas)</div>"
 
 def rechazar_carta():
     global ESTADO
