@@ -85,12 +85,11 @@ index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
 index.add(embeddings_matrix)
 print(f"✅ Listo. {index.ntotal} cartas en memoria.")
 
-# --- INICIALIZAR CONTADOR DESDE EL CSV ---
+# --- INICIALIZAR CONTADOR PERSISTENTE ---
 if os.path.exists(CSV_LOG):
     try:
         df_log = pd.read_csv(CSV_LOG)
         conteo_inicial = len(df_log)
-        print(f"📊 Contador restaurado: ¡Llevas {conteo_inicial} cartas escaneadas!")
     except:
         conteo_inicial = 0
 else:
@@ -218,6 +217,7 @@ def scan_realtime(imagen):
             ESTADO["blacklist_variantes"].clear()
             return "<div class='mensaje-buscando' style='color:#03a9f4;'>Encuadra la carta (Evita moverla)...</div>"
 
+        # NUEVO: EJECUCIÓN EN PARALELO (CLIP y OCR al mismo tiempo)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futuro_clip = executor.submit(tarea_clip, card_img)
             futuro_ocr = executor.submit(tarea_ocr, card_img)
@@ -262,7 +262,7 @@ def scan_realtime(imagen):
             if puntaje_fuzzy >= 65:
                 nombre_ingles_real = diccionario_busqueda[nombre_identificado]
                 carta_ganadora = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
-                metodo_log = f"OCR: '{texto_ocr}'"
+                metodo_log = f"Local OCR: '{texto_ocr}'"
             
             else:
                 mejor_global = process.extractOne(
@@ -295,37 +295,40 @@ def scan_realtime(imagen):
 
         latencia_ms = (time.time() - t_start) * 1000
         nc = carta_ganadora.get('collector_number', '???')
-        set_code = carta_ganadora['set_code'].lower()
         
-        ESTADO["pausado"] = True
-        ESTADO["id"] = carta_ganadora['id']
-        ESTADO["nombre"] = carta_ganadora['name']
-        ESTADO["set"] = carta_ganadora['set_code']
-        ESTADO["nc"] = nc
-        ESTADO["imagen_temp"] = card_img 
+        # --- NUEVA LÓGICA DE TRADUCCIÓN Y PREVIEW (HTML) ---
+        nombre_ingles = carta_ganadora['name']
         
-        # --- UI REDISEÑADA CON CONTADOR INYECTADO ---
+        # Buscar la traducción al español en la Piedra Rosetta
+        traducciones = rosetta_stone.get(nombre_ingles, [])
+        nombre_castellano = " (Sin traducción local)"
+        for t in traducciones:
+            if t != nombre_ingles: # Asumimos que si es distinta, es el idioma local
+                nombre_castellano = f" / {t}"
+                break
+        
+        image_uri = carta_ganadora.get('image_uri', '')
+
+        # UI Rediseñada para el Bulk Escaneo masivo
         html_resultado = f"""
-        <div class='mensaje-detectado' style='position: relative;'>
-            <div style='position: absolute; top: 6px; right: 10px; font-size: 11px; color: #aaa; font-weight: 800; letter-spacing: 0.5px;'>
-                📝 {ESTADO['total_guardadas']}
-            </div>
-            
-            <div style='font-size: 18px; font-weight: 800; margin-bottom: 6px; letter-spacing: 0.5px;'>
-                {carta_ganadora['name']}
-            </div>
-            
-            <div style='display: flex; justify-content: center; align-items: center; gap: 10px; font-size: 15px; color: #ddd; margin-bottom: 8px; background: rgba(255,255,255,0.05); padding: 5px; border-radius: 6px;'>
-                <img src='https://svgs.scryfall.io/sets/{set_code}.svg' style='width: 22px; height: 22px; filter: invert(0.9);' alt='{set_code}'>
-                <strong style='color: #fff;'>{set_code.upper()}</strong>
-                <span style='color: #666;'>|</span>
-                <strong style='color: #4fc3f7;'>#{nc}</strong>
-                <span style='color: #666;'>|</span>
-                <span>👁️ {(D[0][0]*100):.1f}%</span>
-            </div>
-            
-            <div style='font-size: 11px; color: #4caf50; font-family: monospace;'>
-                {metodo_log} (Score: {puntaje_fuzzy:.0f}) ⚡ {latencia_ms:.0f}ms
+        <div class='mensaje-detectado'>
+            <div style='display: flex; align-items: center; gap: 15px;'>
+                <img src='{image_uri}' style='width: 45px; height: 63px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.5);' alt='arte'>
+                
+                <div style='flex: 1;'>
+                    <div style='font-size: 16px;'>
+                        <strong style='color: #fff;'>{nombre_ingles}</strong>
+                        <span style='color: #4caf50; font-weight: bold;'>{nombre_castellano}</span>
+                    </div>
+                    
+                    <div style='font-size: 13px; color: #aaa; margin-top: 2px;'>
+                        Set: {carta_ganadora['set_code'].upper()} | NC: #{nc} | Visual: {(D[0][0]*100):.1f}%
+                    </div>
+                    
+                    <div style='font-size: 11px; color: #666; font-family: monospace;'>
+                        {metodo_log} (Score: {puntaje_fuzzy:.0f}) ⚡ {latencia_ms:.0f}ms
+                    </div>
+                </div>
             </div>
         </div>
         """
@@ -350,6 +353,7 @@ def confirmar_carta():
     nuevo_registro = pd.DataFrame([[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, set_code, nc, ruta_imagen]], columns=["Fecha", "Nombre", "Set", "NC", "Ruta_Imagen"])
     nuevo_registro.to_csv(CSV_LOG, mode='a', index=False, header=not os.path.exists(CSV_LOG))
     
+    # --- ACTUALIZACIÓN DEL CONTADOR PERSISTENTE ---
     ESTADO["total_guardadas"] += 1
     total = ESTADO["total_guardadas"]
     
@@ -357,7 +361,7 @@ def confirmar_carta():
     ESTADO["cooldown_hasta"] = time.time() + 1.5
     ESTADO["blacklist_nombres"].clear()
     ESTADO["blacklist_variantes"].clear()
-    return f"<div class='mensaje-exito'>✅ Guardado (Total: {total} cartas)</div>"
+    return f"<div class='mensaje-exito'>✅ Guardado (Total almacenado: {total} cartas). Retira la carta...</div>"
 
 def rechazar_carta():
     global ESTADO
@@ -377,17 +381,18 @@ def rechazar_version():
 css = """
 .gradio-container { padding: 5px !important; }
 .gradio-container video { transform: none !important; max-height: 40vh; object-fit: contain; }
-#caja-resultado { height: 120px !important; display: flex; align-items: center; justify-content: center; margin-bottom: 5px; width: 100%; }
+#caja-resultado { height: 110px !important; display: flex; align-items: center; justify-content: center; margin-bottom: 5px; width: 100%; }
 .mensaje-buscando { color: #ff9800; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-exito { color: #4caf50; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
 .mensaje-error { color: #f44336; font-size: 16px; font-weight: bold; text-align: center; width: 100%; }
-.mensaje-detectado { background-color: #121212; color: white; padding: 12px; border-radius: 10px; border: 2px solid #4caf50; width: 100%; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
-button { min-height: 55px !important; font-size: 14px !important; font-weight: bold !important; border-radius: 8px !important; letter-spacing: 0.5px; }
+.mensaje-detectado { background-color: #1e1e1e; color: white; padding: 10px; border-radius: 8px; border: 2px solid #4caf50; width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+button { min-height: 50px !important; font-size: 13px !important; font-weight: bold !important; border-radius: 8px !important; }
 """
 
 with gr.Blocks(title="SAURON V2", css=css) as demo:
     with gr.Row(): input_img = gr.Image(sources=["webcam"], streaming=True, type="pil", show_label=False)
-    with gr.Row(): output_html = gr.HTML(value="<div class='mensaje-buscando'>Iniciando SAURON V2.6+UI...</div>", elem_id="caja-resultado")
+    # Mostramos el contador histórico en el HTML inicial
+    output_html = gr.HTML(value=f"<div class='mensaje-buscando'>Iniciando... (Almacenado hasta ahora: {ESTADO['total_guardadas']} cartas)</div>", elem_id="caja-resultado")
     
     with gr.Row():
         btn_no = gr.Button("❌ NO ES", variant="secondary")

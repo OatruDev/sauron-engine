@@ -1,4 +1,4 @@
-# Ignorar secretos (CRÍTICO)
+# Ignorar secretos y configuraciones locales (CRÍTICO)
 .env
 
 # Ignorar datos locales pesados o temporales
@@ -6,3 +6,26 @@ cache/
 failed_cards.log
 processed_ids.txt
 __pycache__/
+*.pyc
+
+# Entornos virtuales de Python
+venv/
+env/
+
+# ========================================================
+# SAURON & KOMUGI: Modelos pesados y Bases de Datos
+# (Esto evita el error de límite de 100MB en GitHub)
+# ========================================================
+sauron_database.pkl
+*.onnx
+*.tflite
+
+# Bases de datos de Edge Computing (SQLite)
+manafox.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Opcional: Si tu carpeta de fotos RLHF se vuelve muy pesada (+1GB),
+# quita el '#' de la línea de abajo para ignorarla también.
+# dataset_rlhf/
