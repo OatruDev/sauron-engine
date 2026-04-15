@@ -12,6 +12,7 @@ from rapidfuzz import process, fuzz
 from PIL import Image, ImageOps
 import pandas as pd
 from datetime import datetime
+import re
 import warnings
 import concurrent.futures
 from collections import deque
@@ -43,7 +44,7 @@ OUT_W, OUT_H   = 400, 560
 # ─────────────────────────────────────────────
 # PARÁMETROS DE FRAME BUFFER (Confidence Lock)
 # ─────────────────────────────────────────────
-CONFIDENCE_LOCK_FRAMES = 2   # Ajustado a 2 para mayor velocidad de detección
+CONFIDENCE_LOCK_FRAMES = 1   # Ajustado a 2 para mayor velocidad de detección
 FRAME_BUFFER_SIZE      = 5   
 
 
@@ -294,19 +295,36 @@ def _html_buscando(msg: str = "Encuadra la carta...") -> str:
     """
 
 
+# Regex: acepta letras latinas + acentos españoles + puntuación básica de nombres de cartas
+_RE_LATINO = re.compile(r"^[A-Za-záéíóúàèìòùäëïöüÁÉÍÓÚÀÈÌÒÙÄËÏÖÜñÑçÇ0-9\s\-\',\.\"!:&/]+$")
+
+def _mejor_traduccion_latina(nombre_ingles: str) -> str:
+    """
+    Devuelve la traducción al español (o cualquier idioma latino) de una carta.
+    Filtra traducciones con caracteres asiáticos/cirílicos usando una regex de
+    script latino. Si no hay ninguna válida, devuelve cadena vacía.
+    """
+    traducciones = rosetta_stone.get(nombre_ingles, [])
+    for t in traducciones:
+        if t == nombre_ingles:
+            continue  # saltar el propio inglés
+        if _RE_LATINO.match(t):
+            return t  # primera coincidencia latina → probablemente español/francés/alemán
+    return ""
+
+
 def _html_resultado(carta: dict, score: float, metodo: str, latencia: float) -> str:
     nombre_ingles = carta['name']
     nc            = carta.get('collector_number', '???')
-    set_code      = carta.get('set_code', '???').upper()
-    image_uri     = _extract_image_uri(carta)          
-    set_svg       = carta.get('icon_svg_uri', '')
+    set_code_raw  = carta.get('set_code', 'unk')
+    set_code      = set_code_raw.upper()
+    image_uri     = _extract_image_uri(carta)
 
-    traducciones     = rosetta_stone.get(nombre_ingles, [])
-    nombre_castellano = ""
-    for t in traducciones:
-        if t != nombre_ingles:
-            nombre_castellano = t
-            break
+    # Bug Fix 3 — Set logo dinámico desde CDN de Scryfall (no depende del .pkl)
+    set_svg = f"https://svgs.scryfall.io/sets/{set_code_raw.lower()}.svg"
+
+    # Bug Fix 2 — Usar heurística de script latino para evitar coreano/cirílico
+    nombre_castellano = _mejor_traduccion_latina(nombre_ingles)
 
     precio_raw  = carta.get('prices', {}) or {}
     precio_eur  = precio_raw.get('eur') or precio_raw.get('usd') or None
@@ -320,11 +338,8 @@ def _html_resultado(carta: dict, score: float, metodo: str, latencia: float) -> 
 
     sub_nombre = f"<div class='card-sub'>{nombre_castellano}</div>" if nombre_castellano else ""
 
-    # Inyección del Set Logo
-    if set_svg:
-        badge_set_html = f"<span class='badge badge--set'><img src='{set_svg}' style='height: 12px; display: inline-block; vertical-align: middle; margin-right: 4px; filter: invert(1);'>{set_code}</span>"
-    else:
-        badge_set_html = f"<span class='badge badge--set'>{set_code}</span>"
+    # Set logo: siempre disponible (URL construida dinámicamente)
+    badge_set_html = f"<span class='badge badge--set'><img src='{set_svg}' style='height:12px;display:inline-block;vertical-align:middle;margin-right:4px;filter:invert(1);' onerror=\"this.style.display='none'\">{set_code}</span>"
 
     return f"""
     <div id='sauron-sheet' class='sheet sheet--locked'>
@@ -435,36 +450,56 @@ def scan_realtime(imagen):
         metodo_log     = "Visual Puro"
         puntaje_fuzzy  = 0
 
-        if texto_ocr:
-            mejor_coincidencia = process.extractOne(query=texto_ocr, choices=list(diccionario_busqueda.keys()), scorer=fuzz.WRatio)
-            if mejor_coincidencia:
-                nombre_identificado, puntaje_fuzzy, _ = mejor_coincidencia
+        # ── BUG FIX 1: OCR-first — buscar globalmente ANTES de confiar en el Top-30 ──
+        # Si el OCR lee algo con suficientes caracteres, hacemos un match global
+        # contra TODA la base de datos (OPCIONES_GLOBALES). Esto soluciona las DFCs
+        # y cualquier carta que no entre en el Top-30 visual de FAISS.
+        if texto_ocr and len(texto_ocr) > 4:
+            mejor_global_directo = process.extractOne(
+                query=texto_ocr,
+                choices=OPCIONES_GLOBALES,
+                scorer=fuzz.WRatio,
+                score_cutoff=80          # umbral alto para evitar falsos positivos
+            )
+            if mejor_global_directo:
+                nombre_global_id, puntaje_global_d, _ = mejor_global_directo
+                nombre_ingles_real = diccionario_global[nombre_global_id]
 
-            if puntaje_fuzzy >= 65:
-                nombre_ingles_real = diccionario_busqueda[nombre_identificado]
-                carta_ganadora     = next(c for c in candidatos_filtrados if c['name'] == nombre_ingles_real)
-                metodo_log         = f"OCR: '{texto_ocr}'"
-            else:
-                mejor_global = process.extractOne(query=texto_ocr, choices=OPCIONES_GLOBALES, scorer=fuzz.WRatio, score_cutoff=75)
-                if mejor_global:
-                    nombre_global_id, puntaje_global, _ = mejor_global
-                    nombre_ingles_real = diccionario_global[nombre_global_id]
+                if nombre_ingles_real not in ESTADO["blacklist_nombres"]:
+                    variantes         = cartas_por_nombre.get(nombre_ingles_real, [])
+                    variantes_validas = [v for v in variantes if v['id'] not in ESTADO["blacklist_variantes"]]
 
-                    if nombre_ingles_real not in ESTADO["blacklist_nombres"]:
-                        variantes       = cartas_por_nombre.get(nombre_ingles_real, [])
-                        variantes_validas = [v for v in variantes if v['id'] not in ESTADO["blacklist_variantes"]]
+                    if variantes_validas:
+                        # Entre todas las variantes válidas, elegir la más similar visualmente
+                        vectores_variantes = [v['parsed_emb'] for v in variantes_validas]
+                        matriz_var         = np.array(vectores_variantes).astype('float32')
+                        similitudes        = np.dot(matriz_var, query_vector.T).flatten()
+                        mejor_var_idx      = np.argmax(similitudes)
 
-                        if variantes_validas:
-                            vectores_variantes = [v['parsed_emb'] for v in variantes_validas]
-                            matriz_var         = np.array(vectores_variantes).astype('float32')
-                            similitudes        = np.dot(matriz_var, query_vector.T).flatten()
-                            mejor_var_idx      = np.argmax(similitudes)
-                            carta_ganadora     = variantes_validas[mejor_var_idx]
-                            puntaje_fuzzy      = puntaje_global
-                            metodo_log         = f"OVERRIDE: '{texto_ocr}'"
+                        carta_ganadora = variantes_validas[mejor_var_idx]
+                        puntaje_fuzzy  = puntaje_global_d
+                        metodo_log     = f"OCR-Global: '{texto_ocr}' ({puntaje_global_d:.0f})"
 
+        # ── Fallback: si el OCR global no encontró nada, usar Top-30 de FAISS ──
+        if carta_ganadora is None and texto_ocr:
+            mejor_local = process.extractOne(
+                query=texto_ocr,
+                choices=list(diccionario_busqueda.keys()),
+                scorer=fuzz.WRatio
+            )
+            if mejor_local:
+                nombre_identificado, puntaje_local, _ = mejor_local
+                if puntaje_local >= 65:
+                    nombre_ingles_real = diccionario_busqueda[nombre_identificado]
+                    carta_ganadora     = next((c for c in candidatos_filtrados if c['name'] == nombre_ingles_real), None)
+                    if carta_ganadora:
+                        puntaje_fuzzy = puntaje_local
+                        metodo_log    = f"OCR-Local: '{texto_ocr}' ({puntaje_local:.0f})"
+
+        # ── Último recurso: Top-1 visual de FAISS ──────────────────────────────
         if carta_ganadora is None:
             carta_ganadora = candidatos_filtrados[0]
+            metodo_log     = "Visual Puro"
 
         latencia_ms = (time.time() - t_start) * 1000
 
